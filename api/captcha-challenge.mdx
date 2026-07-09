@@ -1,0 +1,104 @@
+---
+title: "POST /api/captcha/challenge — Request a PoW Challenge"
+sidebarTitle: "POST /captcha/challenge"
+description: "POST /api/captcha/challenge proxies to the Cap standalone server to obtain a proof-of-work puzzle. Difficulty scales with the client's daily vote count."
+---
+
+`POST /api/captcha/challenge` sits between the Cap widget (running in the browser) and the Cap standalone server. Rather than letting the widget contact the Cap server directly — which would require CORS headers and expose the server URL — every challenge request passes through this endpoint. The server intercepts the call to enforce per-IP rate limiting and to compute a difficulty level based on how many votes the caller has already cast today, so high-volume clients face harder puzzles without any client-side influence over that value.
+
+## When captcha is disabled
+
+If `CAP_API_URL` is not set (or DragonFly is unavailable), the endpoint returns immediately:
+
+```json
+{ "error": "captcha_disabled" }
+```
+
+**Status**: `404 Not Found`
+
+## Request
+
+```http
+POST /api/captcha/challenge HTTP/1.1
+```
+
+No request body is required. Any body sent by the widget is **ignored** — difficulty is set server-side to prevent clients from requesting easier puzzles.
+
+The `CF-Connecting-IP` header must be present. In production this is injected by Cloudflare; in local development behind a trusted proxy it is read from `X-Forwarded-For`.
+
+## Rate limiting
+
+Before proxying to Cap, the endpoint calls `consumeAbuseLimit('captcha:challenge', ip, max, 60)` backed by DragonFly (or an in-memory fallback when DragonFly is absent). The window is 60 seconds.
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `CAP_CHALLENGE_MAX_PER_MINUTE` | `6` | Max challenge requests per IP per 60-second window |
+
+When the limit is exceeded, the response includes a `retry-after` header containing the number of seconds until the current window resets:
+
+```json
+{ "error": "rate_limited" }
+```
+
+**Status**: `429 Too Many Requests`
+
+## Difficulty calculation
+
+The difficulty sent to the Cap server is computed entirely by the application:
+
+```typescript
+function challengeDifficulty(dailyVotes: number): number {
+  const base = Math.max(1, config.captcha.challengeDifficultyBase);   // default 4
+  const max  = Math.max(base, config.captcha.challengeDifficultyMax); // default 8
+  const step = Math.max(1, config.captcha.challengeDifficultyStepVotes); // default 250
+  return Math.min(max, base + Math.floor(dailyVotes / step));
+}
+```
+
+The `dailyVotes` value is the **higher** of the IP-based daily count and the `voter_id`-based daily count (`readDailyVotesMax`). This prevents a client from obtaining easy puzzles by switching IPs while retaining the same `voter_id` cookie.
+
+**Examples with default settings (base 4, max 8, step 250):**
+
+| Daily votes | Difficulty |
+|---|---|
+| 0 – 249 | 4 |
+| 250 – 499 | 5 |
+| 500 – 749 | 6 |
+| 750 – 999 | 7 |
+| 1 000 + | 8 (capped) |
+
+<Tip>
+  Adjust `CAP_CHALLENGE_DIFFICULTY_BASE`, `CAP_CHALLENGE_DIFFICULTY_MAX`, and `CAP_CHALLENGE_DIFFICULTY_STEP_VOTES` to tune the difficulty curve for your expected traffic. A lower step value penalises repeat voters more aggressively.
+</Tip>
+
+## Response
+
+On success, the endpoint passes through the Cap server's response verbatim with its original HTTP status code:
+
+```json
+{ "challenge": "<challenge-token>" }
+```
+
+The `challenge` token is an opaque string issued by the Cap server. The widget uses it to present the proof-of-work puzzle to the user and will include it in the subsequent `POST /api/captcha/redeem` call.
+
+## Error responses
+
+| Status | Body `error` field | Cause |
+|---|---|---|
+| `403` | `trusted_ip_required` | `CF-Connecting-IP` (or trusted proxy header) is absent |
+| `404` | `captcha_disabled` | `CAP_API_URL` is not set or DragonFly is unavailable |
+| `429` | `rate_limited` | Exceeded `CAP_CHALLENGE_MAX_PER_MINUTE` in the current window |
+| `502` | `captcha_unreachable` | The Cap server did not respond within `CAP_HTTP_TIMEOUT_MS` (default 5 000 ms) |
+| `503` | `rate_limit_unavailable` | DragonFly threw while incrementing the abuse counter |
+| `503` | `daily_limit_unavailable` | DragonFly threw while reading the daily vote count for difficulty calculation |
+
+## Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CAP_API_URL` | _(unset)_ | Base URL of the Cap standalone server (including site key). Required. |
+| `CAP_CHALLENGE_MAX_PER_MINUTE` | `6` | Per-IP challenge rate limit. |
+| `CAP_CHALLENGE_DIFFICULTY_BASE` | `4` | Minimum PoW difficulty. |
+| `CAP_CHALLENGE_DIFFICULTY_MAX` | `8` | Maximum PoW difficulty. |
+| `CAP_CHALLENGE_DIFFICULTY_STEP_VOTES` | `250` | Daily votes needed to increase difficulty by one step. |
+| `CAP_HTTP_TIMEOUT_MS` | `5000` | Hard timeout (ms) for the server-to-Cap fetch. |

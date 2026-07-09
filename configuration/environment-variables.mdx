@@ -1,0 +1,156 @@
+---
+title: "Environment Variable Reference for Mundial de Clicks"
+sidebarTitle: "Env Variables"
+description: "Complete reference for all environment variables. All are optional locally — defaults target Docker Compose services. Set them in Coolify for production."
+---
+
+All environment variables in Mundial de Clicks are **optional in local development** — the defaults point to the Docker Compose infrastructure (DragonFly on `localhost:6379`). In production, define them on the app service in Coolify; the running container picks them up without any code change. Variables prefixed `PUBLIC_` are special: Vite/Astro bakes them into the client bundle **at build time**, so they are not configurable at runtime.
+
+<Warning>
+  `PUBLIC_*` variables are read at **build time** by Vite/Astro. Changing them requires a full redeploy — restarting the container is not enough.
+</Warning>
+
+<Tip>
+  In local dev you don't need any variables at all. Run `docker compose up -d` and `pnpm dev` and everything works with the built-in defaults.
+</Tip>
+
+## DragonFly Connection
+
+Mundial de Clicks stores votes, sessions, and rate-limit counters in DragonFly, a Redis-compatible in-memory data store. You can configure the connection with a single URL (option A) or with individual host/port/password variables (option B). `REDIS_URL` takes precedence when both are set.
+
+<ParamField query="REDIS_URL" type="string">
+  Full Redis connection URL, e.g. `redis://dragonfly:6379` or `redis://:password@dragonfly:6379`. When set, the `DRAGONFLY_*` variables below are ignored. In Coolify, point this at the internal service name of your DragonFly resource (e.g. `redis://dragonfly:6379`).
+</ParamField>
+
+<ParamField query="DRAGONFLY_HOST" type="string" default="localhost">
+  Hostname of the DragonFly instance. Ignored when `REDIS_URL` is set.
+</ParamField>
+
+<ParamField query="DRAGONFLY_PORT" type="string" default="6379">
+  Port of the DragonFly instance. Ignored when `REDIS_URL` is set.
+</ParamField>
+
+<ParamField query="DRAGONFLY_PASSWORD" type="string">
+  Optional authentication password for DragonFly. Ignored when `REDIS_URL` is set (embed the password in the URL instead).
+</ParamField>
+
+<ParamField query="REDIS_COMMAND_TIMEOUT_MS" type="number" default="2000">
+  Hard timeout in milliseconds applied to every DragonFly command. If DragonFly does not respond within this window the request fails fast rather than hanging indefinitely. Raise this value only if you are on a high-latency link to DragonFly.
+</ParamField>
+
+## Rate Limiting
+
+These variables control the per-IP vote rate limiter that runs inside a Lua script on DragonFly. The defaults allow a comfortable human click pace while the captcha handles bot-scale abuse.
+
+<ParamField query="RATE_LIMIT_MAX" type="number" default="5">
+  Maximum number of valid votes accepted per IP within a single time window. The default of 5 per 1-second window equals 5 clicks/s — comfortable for a human, but the captcha is the primary bot defense.
+</ParamField>
+
+<ParamField query="RATE_LIMIT_WINDOW" type="number" default="1">
+  Duration of the rate-limit window in seconds. A 1-second window produces smoother limiting than longer windows at the same per-second rate.
+</ParamField>
+
+## Captcha (Cap PoW)
+
+Mundial de Clicks integrates [Cap](https://capjs.js.org/), a self-hosted Proof-of-Work captcha, to prevent automated voting at scale. Captcha is **only active when DragonFly is also configured**, because verified sessions are stored in DragonFly.
+
+<ParamField query="CAP_API_URL" type="string">
+  Full URL to your Cap standalone server, including the site key path segment. Example: `https://cap.example.com/your-site-key`. The app proxies `/api/cap/challenge` and `/api/cap/redeem` to this URL, keeping the client on the same origin (no CORS). If this variable is empty, captcha is disabled and votes are accepted without a PoW challenge.
+</ParamField>
+
+<ParamField query="CAP_VOTES_PER_SESSION" type="number" default="50">
+  Number of votes a single solved captcha session may cast before a new challenge is required. Prevents a solved cookie from acting as a permanent pass for its entire TTL.
+</ParamField>
+
+<ParamField query="CAP_SESSION_HARD_VOTE_CAP" type="number" default="50">
+  Hard cap on votes per captcha session, regardless of `CAP_VOTES_PER_SESSION`. Both limits are evaluated; whichever is lower wins.
+</ParamField>
+
+<ParamField query="CAP_SESSION_TTL_SECONDS" type="number" default="120">
+  Maximum lifetime of a verified captcha session in seconds. The TTL is renewed on each successful vote, so active voters are not interrupted.
+</ParamField>
+
+<ParamField query="CAP_CHALLENGE_MAX_PER_MINUTE" type="number" default="6">
+  Maximum number of challenge requests (the initial PoW puzzle fetch) allowed per IP per minute.
+</ParamField>
+
+<ParamField query="CAP_REDEEM_MAX_PER_MINUTE" type="number" default="12">
+  Maximum number of redeem requests (solution verification) allowed per IP per minute.
+</ParamField>
+
+<ParamField query="CAP_CHALLENGE_DIFFICULTY_BASE" type="number" default="4">
+  Base PoW difficulty level issued to all clients. Higher values mean more computation required from the browser.
+</ParamField>
+
+<ParamField query="CAP_CHALLENGE_DIFFICULTY_MAX" type="number" default="8">
+  Maximum PoW difficulty level. Difficulty increases progressively for IPs with high daily vote counts, up to this ceiling.
+</ParamField>
+
+<ParamField query="CAP_CHALLENGE_DIFFICULTY_STEP_VOTES" type="number" default="250">
+  Daily votes cast by an IP before the PoW difficulty increments by one step. At the default, an IP that has cast 250 votes that day receives difficulty 5, 500 votes → difficulty 6, and so on up to `CAP_CHALLENGE_DIFFICULTY_MAX`.
+</ParamField>
+
+<ParamField query="CAP_HTTP_TIMEOUT_MS" type="number" default="5000">
+  Timeout in milliseconds for server-to-Cap HTTP requests (challenge issue and redeem verification). If the Cap server does not respond within this window, the captcha step fails with a 504.
+</ParamField>
+
+## Daily Vote Limits
+
+<ParamField query="DAILY_VOTE_MAX_PER_IP" type="number" default="2000">
+  Maximum number of votes **counted** per IP address per UTC calendar day. Votes beyond this threshold are accepted by the API (no error is returned) but are not added to any team's total, preventing a single IP from skewing results across a full day.
+</ParamField>
+
+## Real-Time Streaming
+
+These variables tune the Server-Sent Events (SSE) system that pushes live ranking updates to connected browsers.
+
+<ParamField query="STREAM_INTERVAL_MS" type="number" default="1000">
+  How often (in milliseconds) the server sends a ranking snapshot to all connected SSE clients. Lower values produce more responsive updates at the cost of higher CPU and bandwidth.
+</ParamField>
+
+<ParamField query="MAX_SSE_CONNECTIONS" type="number" default="20000">
+  Global cap on simultaneous SSE connections across all IPs. Requests that would exceed this limit receive a 503. Acts as a basic defence against socket or memory exhaustion.
+</ParamField>
+
+<ParamField query="MAX_SSE_CONNECTIONS_PER_IP" type="number" default="4">
+  Per-IP cap on simultaneous SSE connections. Prevents a single client from holding many streams open (e.g. many browser tabs on the same IP).
+</ParamField>
+
+<ParamField query="RANKING_MIN_REFRESH_MS" type="number" default="750">
+  Minimum age in milliseconds between forced ranking refreshes triggered by `GET /api/ranking`. Prevents rapid polling from hammering DragonFly when many clients request the ranking simultaneously.
+</ParamField>
+
+## Security
+
+<ParamField query="ORIGIN_GUARD_SECRET" type="string">
+  A shared secret that must be present in the `x-origin-guard` request header for all non-health requests. Configure a Cloudflare Transform Rule to inject this header on every request so that direct access to the origin server is blocked. If empty, the guard is disabled. Recommended in production. See [Security](/configuration/security) for setup instructions.
+</ParamField>
+
+<ParamField query="VOTER_ID_SECRET" type="string">
+  HMAC-SHA256 secret used to sign the persistent `voter_id` cookie. This cookie is a secondary daily vote cap keyed to a browser identity rather than an IP. **Keep this secret stable across deploys** — rotating it invalidates all existing cookies and resets daily per-voter counts. Falls back to `ORIGIN_GUARD_SECRET` if not set separately.
+</ParamField>
+
+## Analytics (Build-Time)
+
+These `PUBLIC_*` variables are evaluated by Vite at build time and embedded in the client JavaScript bundle. They cannot be changed at runtime without a full rebuild and redeploy.
+
+<ParamField query="PUBLIC_UMAMI_SCRIPT_URL" type="string">
+  URL to the Umami analytics script, e.g. `https://umami.example.com/script.js`. Both this and `PUBLIC_UMAMI_WEBSITE_ID` must be set for the script to be injected into the page.
+</ParamField>
+
+<ParamField query="PUBLIC_UMAMI_WEBSITE_ID" type="string">
+  Umami website UUID, e.g. `00000000-0000-0000-0000-000000000000`. Both this and `PUBLIC_UMAMI_SCRIPT_URL` must be set for analytics to activate.
+</ParamField>
+
+## Docker Compose Only
+
+The following variables are **not read by the Astro application**. They are only consumed by `docker-compose.yml` to configure the local Umami analytics service and its Postgres database.
+
+| Variable | Purpose |
+|---|---|
+| `POSTGRES_DB` | Database name for Umami's Postgres instance |
+| `POSTGRES_USER` | Postgres username |
+| `POSTGRES_PASSWORD` | Postgres password |
+| `UMAMI_APP_SECRET` | Secret used by the Umami service itself |
+
+You do not need to set these in Coolify — in production, Umami is configured through its own deployment, separate from the Mundial de Clicks app service.

@@ -1,0 +1,137 @@
+---
+title: "DragonFly Setup: Persistent Vote Storage for Mundial de Clicks"
+sidebarTitle: "DragonFly"
+description: "Configure DragonFly as the persistent vote database for Mundial de Clicks. Covers connection options, snapshot persistence, and production sizing."
+---
+
+DragonFly is the in-memory database at the heart of Mundial de Clicks. It stores all vote counters, rate-limit token buckets, clicks-per-minute (CPM) measurements, captcha session quotas, and daily IP limits. Because DragonFly speaks the Redis protocol, the app uses a standard Redis client — no custom driver is needed.
+
+## Connection options
+
+The app supports two ways to point at DragonFly. `REDIS_URL` takes priority when both are defined.
+
+**Option A — `REDIS_URL` (recommended)**
+
+A single URL in `redis://[:password@]host:port` format. In Coolify this is the internal service name; in Docker Compose it is the container name.
+
+**Option B — individual variables**
+
+Three separate variables: `DRAGONFLY_HOST`, `DRAGONFLY_PORT`, and optionally `DRAGONFLY_PASSWORD`. These are ignored whenever `REDIS_URL` is present.
+
+```bash
+# Option A: URL (Coolify internal service name or Docker container name)
+REDIS_URL=redis://dragonfly:6379
+
+# Option B: individual variables
+DRAGONFLY_HOST=localhost
+DRAGONFLY_PORT=6379
+# DRAGONFLY_PASSWORD=secret  # optional
+```
+
+<Note>
+  In local development you don't need to set either option. The app defaults to
+  `redis://localhost:6379`, which is exactly where `docker compose up -d dragonfly`
+  binds the container.
+</Note>
+
+## Key schema
+
+The table below documents every DragonFly key used by the app. All keys are managed atomically using native Redis/DragonFly commands (`ZINCRBY`, `INCR`, `HSET`, `EXPIRE`, etc.) — no Lua scripts or transactions are required.
+
+| Key pattern | Type | Description |
+| :--- | :--- | :--- |
+| `votes:ranking` | Sorted set (ZSET) | Country codes as members, total vote counts as scores. Used for the live leaderboard. |
+| `votes:total` | Integer | Global counter of all valid votes cast. |
+| `votes:blocked` | Integer | Global counter of clicks that were rejected (rate-limited or flagged). |
+| `cpm:{epochSecond}` | Integer | Vote count in that one-second bucket. The app sums the last 60 buckets to compute clicks per minute. |
+| `rl:{ip}` | Hash | Token-bucket state for rate limiting: fields `tokens` (remaining) and `updated` (ms timestamp). |
+| `cap:sess:{id}` | Integer | Remaining vote quota for a verified captcha session. |
+| `cap:sess-ip:{id}` | String | IP address that created this captcha session. Used to prevent session sharing. |
+| `daily:ip:{ip}:{day}` | Integer | Running vote total for an IP address on a given UTC day (`YYYY-MM-DD`). |
+| `daily:voter:{id}:{day}` | Integer | Running vote total for a `voter_id` cookie on a given UTC day. |
+
+<Info>
+  The sorted set `votes:ranking` has exactly one member per participating
+  country. Memory usage for the ranking structure is negligible regardless of
+  how many votes are cast.
+</Info>
+
+## Persistence
+
+DragonFly persists data through RDB-style **snapshots** — it does not support append-only file (AOF) mode.
+
+The recommended configuration (used in `docker-compose.yml`) is:
+
+```yaml
+command: >
+  dragonfly
+  --dir /data
+  --dbfilename snapshot
+  --snapshot_cron "*/5 * * * *"
+```
+
+| Option | Value | Effect |
+| :--- | :--- | :--- |
+| `--dir` | `/data` | Directory where the snapshot file is written |
+| `--dbfilename` | `snapshot` | Filename for the RDB snapshot |
+| `--snapshot_cron` | `*/5 * * * *` | Snapshot every 5 minutes |
+
+On an unclean restart, at most 5 minutes of vote data is lost. For a click-voting application this is an acceptable trade-off: vote counts are approximate by nature, and the leaderboard recovers instantly once DragonFly reloads the snapshot.
+
+The `dragonfly-data` Docker named volume mounts to `/data` and persists the snapshot file across container restarts, image upgrades, and host reboots.
+
+<Warning>
+  If you delete the `dragonfly-data` volume, all vote history is permanently
+  lost. Back up `/data/snapshot` before any destructive operations.
+</Warning>
+
+## In-memory fallback
+
+When **neither** `REDIS_URL` nor `DRAGONFLY_HOST` is set, `config.redis.url` resolves to the default `redis://localhost:6379`. If a connection to that address fails at startup, the app's `hasDragonfly` flag is set to `false` and it falls back to an in-process memory store (`castVotesMemory` / `readWorldMemory`).
+
+In fallback mode:
+
+- The full UI, SSE live updates, and vote API all work correctly.
+- Votes are **not persisted** — they are lost on every process restart.
+- Rate limiting and daily caps operate against the in-process store (not shared across multiple instances).
+
+This makes local development possible with zero external dependencies, but the fallback is not suitable for production.
+
+## Command timeout
+
+```bash
+REDIS_COMMAND_TIMEOUT_MS=2000  # default
+```
+
+Every DragonFly command is wrapped with a hard timeout controlled by `REDIS_COMMAND_TIMEOUT_MS` (default 2000 ms). If DragonFly does not respond within this window, the request fails immediately instead of hanging indefinitely. This protects the Node event loop and keeps the SSE poller responsive even during a DragonFly hiccup.
+
+Increase this value if DragonFly is under exceptionally heavy write load and you are seeing spurious timeout errors in the logs. Do not set it too high — a long timeout under failure conditions will cause queued requests to pile up.
+
+## Production sizing
+
+<CardGroup cols={2}>
+  <Card title="Throughput" icon="bolt">
+    DragonFly handles tens of thousands of ops/sec on a single core. The
+    Mundial de Clicks workload — one `ZINCRBY`, one `INCR`, and a token-bucket
+    `HSET` per vote — is extremely lightweight. Even a VPS with 1–2 vCPUs is
+    unlikely to saturate DragonFly.
+  </Card>
+  <Card title="Memory" icon="microchip">
+    Memory usage is minimal. The ranking ZSET holds one entry per country
+    (typically 16). Rate-limit hashes and CPM counters are short-lived and
+    auto-expire. Expect well under 10 MB of working set for a busy election
+    day.
+  </Card>
+  <Card title="memlock ulimit" icon="lock">
+    The `ulimits: memlock: -1` entry in `docker-compose.yml` is required.
+    DragonFly attempts to lock its working set in physical RAM for predictable
+    latency. Without this setting, the Linux kernel may refuse the `mlock`
+    syscall, causing DragonFly to log errors or degrade performance.
+  </Card>
+  <Card title="Single poller design" icon="chart-line">
+    The app runs one background poller that reads the full ranking from
+    DragonFly every second and caches it in process memory. SSE clients receive
+    that cached snapshot — DragonFly read load is constant regardless of how
+    many browsers are watching the leaderboard.
+  </Card>
+</CardGroup>

@@ -1,0 +1,87 @@
+---
+title: "GET /api/stream — Server-Sent Events for Real-Time Rankings"
+sidebarTitle: "GET /api/stream"
+description: "GET /api/stream delivers live WorldSnapshot updates via SSE. One serialization per tick is fanned out to all subscribers — viewer count does not increase DragonFly load."
+---
+
+`GET /api/stream` opens a persistent Server-Sent Events (SSE) connection. The server pushes a serialized `WorldSnapshot` every `STREAM_INTERVAL_MS` (default **1 second**, configurable via environment variable) whenever the ranking data has changed. When there are no updates — for example, during a lull in voting — the server emits a `: ping` keep-alive comment every 20 seconds instead, preventing proxies and load balancers from closing the idle connection.
+
+## Connection Limits
+
+The server enforces two independent connection limits to protect against resource exhaustion:
+
+| Limit | Default | Env Variable | Exceeded Response |
+|-------|---------|--------------|-------------------|
+| Global simultaneous connections | 20,000 | `MAX_SSE_CONNECTIONS` | `503` with `retry-after: 5` |
+| Connections per IP | 4 | `MAX_SSE_CONNECTIONS_PER_IP` | `429` with `retry-after: 5` |
+
+<Warning>
+  In production, the client IP is extracted from the `CF-Connecting-IP` header injected by Cloudflare. If this header is absent (e.g. a request bypassing Cloudflare reaches the origin directly), the server returns **403 Trusted IP required** and refuses the connection. Use an `ORIGIN_GUARD_SECRET` Transform Rule in Cloudflare to block direct-origin access.
+</Warning>
+
+## Response Format
+
+**Content-Type:** `text/event-stream`  
+**Cache-Control:** `no-cache, no-transform`  
+**Connection:** `keep-alive`  
+**x-accel-buffering:** `no` (disables nginx proxy buffering, ensuring events are flushed to the client immediately)
+
+Each update is delivered as a standard SSE `data:` event containing a JSON-serialized `WorldSnapshot`. Keep-alive pings are delivered as SSE comment lines (`: ping`), which browsers ignore but which reset proxy idle timers.
+
+```
+data: {"ranking":[...],"totalVotes":87234,"clicksPerMinute":1420,"blockedClicks":342,"events":[...]}
+
+: ping
+
+data: {"ranking":[...],"totalVotes":87290,"clicksPerMinute":1438,"blockedClicks":342,"events":[...]}
+```
+
+The `WorldSnapshot` structure is identical to the body returned by [`GET /api/ranking`](/api/ranking). Refer to that page for full field documentation.
+
+## Client Usage
+
+The following is the actual implementation from `src/scripts/main.ts`. The `EventSource` API handles reconnection automatically — no manual retry logic is needed.
+
+```typescript
+const source = new EventSource('/api/stream');
+
+source.addEventListener('message', (event) => {
+  const snapshot: WorldSnapshot = JSON.parse(event.data);
+  // Monotonic reconciliation — numbers only go up
+  reconcile(snapshot);
+  renderStats();
+  renderRanking();
+  renderEvents(snapshot);
+});
+
+source.addEventListener('error', () => {
+  console.warn('[sse] connection interrupted, reconnecting...');
+  // EventSource reconnects automatically
+});
+```
+
+<Note>
+  The `EventSource` API reconnects automatically on connection drop, using an exponential back-off defined by the browser. The server-side `: ping` heartbeat (emitted every 20 seconds when idle) keeps the TCP connection alive through intermediate proxies and load balancers that would otherwise close idle keep-alive connections.
+</Note>
+
+## Broadcast Architecture
+
+The SSE endpoint is designed so that adding more viewers does not increase load on DragonFly:
+
+1. A single `WorldState` class runs one `setInterval` loop ticking every `STREAM_INTERVAL_MS`.
+2. Each tick triggers exactly **one** `readWorld()` call — a single DragonFly pipeline regardless of how many clients are connected.
+3. `JSON.stringify` is called **once** per tick, and the result is encoded into a `Uint8Array` **once**.
+4. That same `Uint8Array` is pushed to every subscriber via `controller.enqueue(payload)` — no per-client serialization or allocation.
+5. When there are **zero subscribers**, the poller skips the DragonFly read entirely, consuming no resources.
+
+This fan-out design means that 10,000 concurrent viewers cost the same as 1 viewer in terms of DragonFly and CPU load — the only per-client cost is the writable-stream enqueue.
+
+## Backpressure Handling
+
+If a client's readable stream queue grows more than **20 frames** behind the broadcaster (`desiredSize < -20`), the current frame is silently dropped for that client. The client does not receive an error or a gap notification.
+
+This is safe because `WorldSnapshot` values are **monotonically increasing** (vote counts never decrease). The next frame the slow client receives will contain the correct current state — no reconciliation or replay is required.
+
+<Tip>
+  Dropped frames are invisible to the end user. A client that misses 5 seconds of snapshots due to a slow network will display the correct ranking the moment its connection catches up, because each snapshot contains absolute cumulative totals, not deltas.
+</Tip>

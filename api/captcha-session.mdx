@@ -1,0 +1,71 @@
+---
+title: "GET /api/captcha/session — Check Captcha Session Status"
+sidebarTitle: "GET /captcha/session"
+description: "GET /api/captcha/session checks whether the Cap captcha is required and whether the current session cookie is still valid. Used on page load to decide widget display."
+---
+
+`GET /api/captcha/session` is called on every page load to determine whether the Cap captcha widget needs to be shown. It reads the `cap_session` cookie, then validates the session in DragonFly by checking the remaining vote quota and the IP binding stored when the session was created. The result drives two binary decisions in the client: whether to download the Cap WASM bundle at all, and whether to show the challenge UI immediately.
+
+## Request
+
+<ParamField header="Cookie" type="string">
+  The browser's `Cookie` header. The endpoint reads the `cap_session` value from it. No `Authorization` header or request body is required.
+</ParamField>
+
+```http
+GET /api/captcha/session HTTP/1.1
+Cookie: cap_session=550e8400-e29b-41d4-a716-446655440000
+```
+
+## Response
+
+**200 OK** — always returned (errors are represented in the body fields, never as non-200 statuses).
+
+```json
+{ "required": true, "valid": false }
+```
+
+<ResponseField name="required" type="boolean" required>
+  `true` when `CAP_API_URL` is set **and** DragonFly is reachable (`hasCaptcha`). When `false`, the captcha widget is never loaded — no WASM download occurs — and all `POST /api/vote` requests are accepted without a session cookie.
+</ResponseField>
+
+<ResponseField name="valid" type="boolean" required>
+  `true` when all of the following hold: a `cap_session` cookie was sent, the corresponding `cap:sess:{id}` key exists in DragonFly with a remaining quota greater than zero, and the `cap:sess-ip:{id}` key matches the current trusted client IP (`CF-Connecting-IP`). If DragonFly is temporarily unavailable, returns `false` as a safe default — the client will re-verify on the next vote attempt rather than failing with a 500.
+</ResponseField>
+
+<Note>
+  `Cache-Control: no-store` is set on every response. Session validity changes within seconds (votes consume quota; TTL expires), so proxy or browser caching must be avoided.
+</Note>
+
+## Behavior matrix
+
+<Expandable title="required: false — captcha disabled">
+  The environment variable `CAP_API_URL` is not set (or DragonFly is not configured). The Cap WASM bundle is never requested by the browser. The `valid` field is always `true` in this branch, meaning votes are accepted unconditionally. Useful for local development and demo deployments.
+</Expandable>
+
+<Expandable title="required: true, valid: true — active session">
+  A `cap_session` cookie was sent, it exists in DragonFly, the remaining vote quota is ≥ 1, and the stored IP matches the caller's trusted IP. The widget is **not** shown. The browser can vote immediately using the existing cookie; each accepted vote decrements the quota and resets the TTL (default 120 s).
+</Expandable>
+
+<Expandable title="required: true, valid: false — no session or expired">
+  Either no cookie was sent, the DragonFly key has expired, the quota is exhausted, or the IP does not match. The client loads the Cap widget and starts the `POST /api/captcha/challenge` → `POST /api/captcha/redeem` flow to obtain a fresh session.
+</Expandable>
+
+## Session validation internals
+
+The endpoint calls `isSessionValid(id, ip)` from `src/lib/captcha.ts`, which executes a single `MGET` against two DragonFly keys:
+
+| DragonFly key | Contains | TTL |
+|---|---|---|
+| `cap:sess:{id}` | Remaining vote quota (integer string) | `CAP_SESSION_TTL_SECONDS` (default 120 s) |
+| `cap:sess-ip:{id}` | Trusted client IP bound at session creation | Same TTL |
+
+The session is considered valid only when `storedIp === callerIp && quota > 0`. The entire `MGET` is wrapped in a hard timeout (`REDIS_COMMAND_TIMEOUT_MS`, default 2 000 ms); a timeout throws and `valid` is set to `false`.
+
+## Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CAP_API_URL` | _(unset)_ | Enables captcha. Must be set alongside DragonFly for `required` to be `true`. |
+| `REDIS_URL` / `DRAGONFLY_HOST` | `localhost:6379` | Required for session lookups. If absent, captcha is disabled regardless of `CAP_API_URL`. |
+| `REDIS_COMMAND_TIMEOUT_MS` | `2000` | Hard timeout (ms) for the DragonFly `MGET`. |

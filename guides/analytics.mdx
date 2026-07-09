@@ -1,0 +1,129 @@
+---
+title: "Add Umami Analytics to Mundial de Clicks"
+sidebarTitle: "Analytics"
+description: "Configure Umami self-hosted analytics for Mundial de Clicks. Set PUBLIC_UMAMI_SCRIPT_URL and PUBLIC_UMAMI_WEBSITE_ID as build-time variables and redeploy."
+---
+
+Mundial de Clicks optionally integrates [Umami](https://umami.is), a privacy-focused, self-hosted analytics platform. When configured, Umami tracks page views and events without cookies or personal data collection. The integration is entirely opt-in: if the two required variables are absent, no tracking script is loaded at all — not even a blank request.
+
+## How it works
+
+The feature is controlled by two build-time environment variables read via `import.meta.env`:
+
+```ts
+export const hasUmami: boolean =
+  has(import.meta.env.PUBLIC_UMAMI_SCRIPT_URL) &&
+  has(import.meta.env.PUBLIC_UMAMI_WEBSITE_ID);
+```
+
+When `hasUmami` is `true`, the `Layout.astro` component injects the Umami `<script>` tag into the page `<head>`. When it is `false`, the tag is omitted entirely — there is zero analytics overhead in development or in deployments where these variables are not set.
+
+<Warning>
+  `PUBLIC_*` variables are embedded in the JavaScript bundle **at build time** by Vite. Changing them in Coolify or any other platform requires triggering a **full redeploy** — a container restart alone is not enough.
+</Warning>
+
+---
+
+## Setup with Coolify
+
+<Steps>
+  <Step title="Deploy Umami">
+    In Coolify, click **+ New → Service → Umami**. Coolify provisions Umami and a dedicated Postgres database automatically. Wait for both services to show a healthy status.
+  </Step>
+
+  <Step title="Log in and change the default password">
+    Open Umami at its assigned URL. The default credentials are `admin` / `umami`. **Change the password immediately** before proceeding.
+  </Step>
+
+  <Step title="Create a website in Umami">
+    Navigate to **Settings → Websites → Add website**. Enter your site's name and domain. Umami will generate a **Website ID** (a UUID) and a tracking script URL.
+  </Step>
+
+  <Step title="Copy the script URL and Website ID">
+    From the website's **Tracking code** panel, copy:
+    - The script URL, e.g. `https://umami.example.com/script.js`
+    - The Website ID UUID, e.g. `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
+  </Step>
+
+  <Step title="Add build variables to the app service">
+    In Coolify, open the Mundial de Clicks service and go to **Environment Variables**. Add both variables as **Build args** (not runtime vars):
+
+    ```bash
+    PUBLIC_UMAMI_SCRIPT_URL=https://umami.example.com/script.js
+    PUBLIC_UMAMI_WEBSITE_ID=a1b2c3d4-e5f6-7890-abcd-ef1234567890
+    ```
+  </Step>
+
+  <Step title="Trigger a redeploy">
+    Click **Deploy** in Coolify. Because these are build-time variables, the app must be rebuilt — a simple restart has no effect.
+  </Step>
+</Steps>
+
+---
+
+## Setup with Docker
+
+Pass both values as `--build-arg` flags when building the image:
+
+```bash
+docker build \
+  --build-arg PUBLIC_UMAMI_SCRIPT_URL=https://umami.example.com/script.js \
+  --build-arg PUBLIC_UMAMI_WEBSITE_ID=a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
+  -t mundial-de-clicks .
+```
+
+For local development with the bundled `docker-compose.yml`, Umami runs at `http://localhost:3001` (credentials: `admin` / `umami`). Use the local script URL in your `.env`:
+
+```bash
+# .env (local only)
+PUBLIC_UMAMI_SCRIPT_URL=http://localhost:3001/script.js
+PUBLIC_UMAMI_WEBSITE_ID=00000000-0000-0000-0000-000000000000
+```
+
+Then rebuild the dev container after editing `.env`:
+
+```bash
+docker compose up --build
+```
+
+---
+
+## Verifying the integration
+
+<CardGroup cols={2}>
+  <Card title="Browser DevTools" icon="browser">
+    Open the Network tab and reload the page. You should see a request to your Umami script URL (e.g. `script.js`) with a `200` status. Subsequent page interactions will trigger `POST` requests to `/api/send` on the Umami host.
+  </Card>
+  <Card title="Umami Real-time dashboard" icon="chart-line">
+    In the Umami dashboard, open the **Realtime** tab for your website. Within a few seconds of loading the app, you should see an active visitor appear.
+  </Card>
+</CardGroup>
+
+You can also query the app's status endpoint to confirm the feature flag is set:
+
+```bash
+curl https://your-app.example.com/api/status
+```
+
+```json
+{
+  "dragonfly": true,
+  "captcha": true,
+  "umami": true,
+  "store": "redis"
+}
+```
+
+A `"umami": true` value means both `PUBLIC_UMAMI_SCRIPT_URL` and `PUBLIC_UMAMI_WEBSITE_ID` were present at build time.
+
+---
+
+## Notes
+
+<Note>
+  `PUBLIC_UMAMI_WEBSITE_ID` and `PUBLIC_UMAMI_SCRIPT_URL` are intentionally public values — they are safe to ship in the client-side JavaScript bundle. They identify your site to Umami but carry no secret privileges.
+</Note>
+
+<Tip>
+  If you host Umami behind Cloudflare, enable **Rocket Loader** bypass for the Umami script path (`/script.js`) to avoid delayed loading. Alternatively, use Umami's **custom script name** feature to serve it from a path that is not on Cloudflare's default denylist.
+</Tip>

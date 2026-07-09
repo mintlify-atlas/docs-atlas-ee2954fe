@@ -1,0 +1,57 @@
+---
+title: "GET /api/health — Node Server Health Check"
+sidebarTitle: "GET /health"
+description: "GET /api/health returns 200 OK when the Node.js server is running. Does not check DragonFly or other dependencies — used by Coolify and Traefik as a liveness probe."
+---
+
+`GET /api/health` is a lightweight liveness probe. It returns `200 OK` with a plain-text body of `OK` immediately, without touching DragonFly, the Cap server, or any other external dependency. Coolify and Traefik poll this endpoint to decide whether the container is alive and eligible to receive traffic. Because the implementation contains no I/O whatsoever, response time is effectively zero and the endpoint cannot fail due to infrastructure issues unrelated to the Node.js process itself.
+
+## Request
+
+```http
+GET /api/health HTTP/1.1
+```
+
+No parameters, no authentication, no cookies required.
+
+## Response
+
+**Status**: `200 OK`
+
+```
+OK
+```
+
+<ResponseField name="body" type="string">
+  The literal string `OK`. Content-Type is `text/plain`. `Cache-Control: no-store` prevents any intermediate proxy from returning a stale `OK` after the server has stopped.
+</ResponseField>
+
+## Why no dependency checks?
+
+A liveness probe answers one question: *is the process alive and accepting TCP connections?* Extending it to also verify DragonFly connectivity would turn it into a readiness probe and introduce failure modes that do not indicate a sick container:
+
+- DragonFly may restart independently during a rolling update. Without dependency checks, the app container remains healthy and continues serving cached in-memory state. With them, a healthy Node process would be killed and restarted unnecessarily.
+- A DragonFly connection timeout (up to `REDIS_COMMAND_TIMEOUT_MS`, default 2 000 ms) would delay every health-check response, causing Coolify to mark the container as unhealthy after only one or two slow probes.
+
+Use `GET /api/status` to verify that optional integrations are configured and reachable at the application level.
+
+<Note>
+  This endpoint is intentionally excluded from the `x-origin-guard` check. Health probes originate from Coolify and Traefik directly — not through Cloudflare — so they will never carry the `x-origin-guard` secret header. Applying the guard here would cause all probes to fail with `403`.
+</Note>
+
+## Coolify configuration
+
+Point the health-check path to `/api/health` in your Coolify service settings:
+
+| Setting | Recommended value |
+|---|---|
+| Health check path | `/api/health` |
+| Health check interval | ≤ 30 s |
+| Health check timeout | 5 s |
+| Unhealthy threshold | 3 consecutive failures |
+
+A 30-second interval means Coolify detects a crashed container within half a minute. Tightening the interval to 10 s gives faster detection with negligible overhead given the zero-I/O implementation.
+
+<Tip>
+  If you are running Traefik as a reverse proxy alongside Coolify, configure a Traefik `healthcheck` label pointing to `/api/health` so that Traefik also stops routing traffic during restarts — even before Coolify's own probe fires.
+</Tip>

@@ -1,0 +1,97 @@
+---
+title: "Feature Flags: Progressively Enable DragonFly, Captcha, and Umami"
+sidebarTitle: "Feature Flags"
+description: "Mundial de Clicks uses three runtime flags to enable persistence, anti-bot protection, and analytics. The app works without any of them configured."
+---
+
+Mundial de Clicks is designed to work out of the box with **no environment variables set at all**. In this zero-config state votes are stored in process memory and the ranking updates live — a useful mode for local development and demos. Three feature flags progressively unlock production-grade capabilities as you configure the corresponding variables, so you can bring up one piece at a time without the app breaking at any intermediate stage.
+
+## Feature Flags
+
+<CardGroup cols={3}>
+  <Card title="hasDragonfly" icon="database">
+    **`true`** when `REDIS_URL` or `DRAGONFLY_HOST` is set.
+
+    Enables persistent vote storage in DragonFly. Without it, all vote counts live in Node process memory and are lost on every restart.
+  </Card>
+  <Card title="hasCaptcha" icon="shield-check">
+    **`true`** when `CAP_API_URL` is set **and** `hasDragonfly` is also `true`.
+
+    Enables Cap Proof-of-Work anti-bot protection. Requires DragonFly because verified captcha sessions are stored there. Cannot be enabled without persistence.
+  </Card>
+  <Card title="hasUmami" icon="chart-line">
+    **`true`** when both `PUBLIC_UMAMI_SCRIPT_URL` and `PUBLIC_UMAMI_WEBSITE_ID` are set **at build time**.
+
+    Injects the Umami analytics script into every page. These are `PUBLIC_*` variables read by Vite during the build; changing them requires a full redeploy.
+  </Card>
+</CardGroup>
+
+## TypeScript Interface
+
+The `FeatureStatus` interface describes the shape of the JSON payload returned by `/api/status` and is exported from `src/lib/features.ts`:
+
+```typescript
+export interface FeatureStatus {
+  /** Persistent vote storage active. */
+  dragonfly: boolean;
+  /** Cap PoW anti-bot captcha active. */
+  captcha: boolean;
+  /** Umami analytics active. */
+  umami: boolean;
+  /** Store in use: 'redis' (DragonFly) or 'memory' (demo). */
+  store: 'redis' | 'memory';
+}
+```
+
+## `/api/status` Endpoint
+
+The app exposes `GET /api/status` which returns a `FeatureStatus` JSON object reflecting the current flag state. The web UI calls this endpoint on load and displays a visual warning banner for each feature that is not configured. This makes it immediately obvious from the browser which integrations are connected and which are still missing — no need to inspect logs or environment files.
+
+Example response when only DragonFly is configured:
+
+```json
+{
+  "dragonfly": true,
+  "captcha": false,
+  "umami": false,
+  "store": "redis"
+}
+```
+
+## Operating Modes
+
+The combination of active flags defines four distinct operating modes:
+
+| Mode | Conditions | Behavior |
+|---|---|---|
+| **Demo (memory)** | No env vars set | Votes stored in process memory. No persistence — counts reset on every restart. |
+| **Persistent** | `REDIS_URL` set | Votes stored in DragonFly. Survive restarts and scale across instances. |
+| **Protected** | `REDIS_URL` + `CAP_API_URL` | Persistent votes plus Cap PoW captcha. Bot-scale abuse blocked. |
+| **Full** | All vars configured | Persistent + captcha + Umami analytics. Recommended for public deployments. |
+
+<Warning>
+  In production (`NODE_ENV=production`), if `hasCaptcha` is `false`, `POST /api/vote` returns **503 Service Unavailable**. Always configure both `REDIS_URL` (so `hasDragonfly` is true) and `CAP_API_URL` before going live. Without both, the vote API is intentionally disabled to prevent unprotected production deployments.
+</Warning>
+
+## Flag Evaluation Logic
+
+The flags are evaluated once at module load time in `src/lib/features.ts`. The evaluation is straightforward:
+
+```typescript
+// true if REDIS_URL or DRAGONFLY_HOST is non-empty
+export const hasDragonfly: boolean =
+  has(process.env.REDIS_URL) || has(process.env.DRAGONFLY_HOST);
+
+// true only when CAP_API_URL is set AND DragonFly is available
+export const hasCaptcha: boolean =
+  has(process.env.CAP_API_URL) && hasDragonfly;
+
+// true when both PUBLIC_ build-time vars are present
+export const hasUmami: boolean =
+  has(import.meta.env.PUBLIC_UMAMI_SCRIPT_URL) &&
+  has(import.meta.env.PUBLIC_UMAMI_WEBSITE_ID);
+```
+
+<Note>
+  `hasDragonfly` does **not** verify that DragonFly is reachable — it only checks whether the variable is set. If DragonFly is configured but unavailable, the app will surface connection errors at request time rather than at startup.
+</Note>

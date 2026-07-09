@@ -1,47 +1,78 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Mundial de Clicks Locally"
+sidebarTitle: "Quickstart"
+description: "Run Mundial de Clicks on your machine in three commands. Requires Node >= 22, pnpm, and Docker. No environment variables needed for local development."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+Getting Mundial de Clicks running locally requires zero configuration. All environment variables have sensible defaults baked into `src/lib/config.ts` — the Redis connection defaults to `localhost:6379` via `buildRedisUrl()`, so as long as Docker is running with DragonFly on the standard port, the app connects automatically without a single line in `.env`.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+  **Prerequisites**
 
-## Prerequisites
+  - **Node.js ≥ 22.12.0** — enforced by the `engines` field in `package.json`
+  - **pnpm** (the project uses `pnpm@11.5.0` as its package manager)
+  - **Docker** (with Docker Compose) — to run DragonFly, Postgres, and Umami
+</Note>
 
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Setup
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
-
+  <Step title="Clone the repository and install dependencies">
     ```bash
-    npm install your-package
+    git clone https://github.com/midudev/mundial-de-clicks.git
+    cd mundial-de-clicks
+    pnpm install
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
+  <Step title="Start the infrastructure with Docker Compose">
     ```bash
-    your-cli init
+    docker compose up -d
     ```
+
+    This single command starts three services defined in `docker-compose.yml`:
+
+    - **DragonFly** — the Redis-protocol in-memory vote store, exposed on `localhost:6379`, with snapshot persistence to a named Docker volume every 5 minutes
+    - **Postgres** — the relational database that Umami requires for storing analytics events
+    - **Umami** — the self-hosted analytics dashboard, exposed on `localhost:3001`
+
+    <Tip>
+      If you only need the voting backend and don't care about analytics, you can start just DragonFly:
+
+      ```bash
+      docker compose up -d dragonfly
+      ```
+
+      The app detects that `DRAGONFLY_HOST` resolves and connects; the Umami-related environment variables (`PUBLIC_UMAMI_SCRIPT_URL`, `PUBLIC_UMAMI_WEBSITE_ID`) are not set, so `hasUmami` is `false` and no analytics script is injected.
+    </Tip>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
+  <Step title="Start the development server">
     ```bash
-    your-cli start
+    pnpm dev
     ```
+
+    Astro starts in SSR mode with the Node adapter. Open **http://localhost:4321** in your browser — you'll see the voting grid, the live ranking, and the clicks-per-minute counter already updating.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Local Services
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+| Service | URL | Notes |
+|---|---|---|
+| App | http://localhost:4321 | The voting web app (Astro SSR) |
+| Umami | http://localhost:3001 | Analytics dashboard — default login: `admin` / `umami` |
+| DragonFly | `localhost:6379` | Redis protocol — connect with any Redis client |
+
+## Available Commands
+
+| Command | Action |
+|---|---|
+| `pnpm dev` | Start the Astro development server at `localhost:4321` with HMR |
+| `pnpm build` | Compile a production build into `./dist/` |
+| `pnpm preview` | Serve the production build locally (runs the compiled `entry.mjs`) |
+| `pnpm check` | Run `astro check` for TypeScript type-checking across `.astro` and `.ts` files |
+
+<Tip>
+  **No Docker? No problem.** If you skip `docker compose up` entirely, the app still starts. When neither `REDIS_URL` nor `DRAGONFLY_HOST` is set, the `hasDragonfly` flag in `src/lib/features.ts` is `false` and all vote operations fall back to an in-process `Map` (`castVotesMemory` / `readWorldMemory`). There is no persistence — votes disappear on server restart — but the complete UI, SSE stream, optimistic updates, and ranking animations all work. This is ideal for fast frontend iteration without spinning up any infrastructure.
 </Tip>

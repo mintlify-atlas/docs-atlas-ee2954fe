@@ -1,0 +1,116 @@
+---
+title: "POST /api/captcha/redeem — Redeem a Solved PoW Challenge"
+sidebarTitle: "POST /captcha/redeem"
+description: "POST /api/captcha/redeem validates a solved Cap proof-of-work, creates a DragonFly session, and sets the cap_session and voter_id cookies."
+---
+
+`POST /api/captcha/redeem` is the final step of the Cap captcha flow. The browser submits the solved proof-of-work payload it received from the Cap widget. This endpoint proxies that payload to the Cap standalone server for verification. If verification succeeds, the server creates a vote session in DragonFly and responds with two `Set-Cookie` headers: `cap_session` (the short-lived vote quota cookie) and `voter_id` (a persistent identity cookie lasting 180 days). Only after this exchange can the browser start casting votes.
+
+## Prerequisites
+
+Two conditions must be met before the endpoint accepts any request:
+
+- **Captcha must be enabled**: `CAP_API_URL` must be set and DragonFly must be reachable. If not, returns `404 { "error": "captcha_disabled" }`.
+- **`VOTER_ID_SECRET` must be configured**: the voter identity cookie is HMAC-signed; without a signing key the endpoint cannot issue it. Returns `503 { "error": "voter_id_secret_missing" }` if missing. In non-production environments, a hardcoded development secret is used as a fallback.
+
+## Request
+
+```http
+POST /api/captcha/redeem HTTP/1.1
+Content-Type: application/json
+
+{ "token": "<solution-token>", "challenge": "<challenge-token>" }
+```
+
+<ParamField body="token" type="string" required>
+  The proof-of-work solution produced by the Cap widget after the user completes the puzzle.
+</ParamField>
+
+<ParamField body="challenge" type="string" required>
+  The challenge token originally issued by `POST /api/captcha/challenge`. The Cap server uses this to match the solution to the original puzzle.
+</ParamField>
+
+The body is forwarded verbatim to `{CAP_API_URL}/redeem`. Any extra fields the Cap widget includes are passed through unchanged.
+
+## Rate limiting
+
+The endpoint applies a per-IP rate limit of `CAP_REDEEM_MAX_PER_MINUTE` (default `12`) requests per 60-second window, enforced via `consumeAbuseLimit`. When the limit is exceeded, a `retry-after` header is included in the `429` response:
+
+```json
+{ "success": false, "error": "rate_limited" }
+```
+
+## Response on success
+
+**Status**: `200 OK`
+
+```json
+{ "success": true }
+```
+
+Two cookies are set in the response:
+
+<ResponseField name="cap_session" type="cookie">
+  Short-lived session cookie. Value is a UUID v4 that maps to two DragonFly keys:
+
+  - `cap:sess:{id}` — remaining vote quota, initialised to `min(CAP_VOTES_PER_SESSION, CAP_SESSION_HARD_VOTE_CAP)` (default `50`).
+  - `cap:sess-ip:{id}` — the trusted client IP bound at creation time.
+
+  Cookie attributes: `Path=/; HttpOnly; SameSite=Lax; Max-Age={CAP_SESSION_TTL_SECONDS}` (default 120 s). Each accepted vote decrements the quota and renews the TTL. The session expires by time or by exhausting the quota, whichever comes first. The `Secure` flag is omitted intentionally — the app may be served over plain HTTP (e.g. `sslip.io` without TLS).
+</ResponseField>
+
+<ResponseField name="voter_id" type="cookie">
+  Persistent identity cookie. Format: `{uuid}.{base64url-hmac}`. The UUID is either read from an existing valid `voter_id` cookie (preserving continuity across sessions) or freshly generated. The HMAC is computed with HMAC-SHA256 using `VOTER_ID_SECRET` (falling back to `ORIGIN_GUARD_SECRET`).
+
+  Cookie attributes: `Path=/; HttpOnly; SameSite=Lax; Max-Age=15552000` (180 days). Survives browser restarts. Used as a secondary daily vote cap alongside the IP-based cap — a client who changes IPs cannot reset their daily allowance while keeping the same `voter_id`.
+</ResponseField>
+
+## Response on Cap verification failure
+
+If the Cap server returns a non-200 status or a body where `success` is not `true`, the endpoint relays the Cap server's response directly without creating a session or setting cookies:
+
+```json
+{ "success": false, "error": "invalid_solution" }
+```
+
+**Status**: whatever the Cap server returned (typically `400`).
+
+## Session creation details
+
+On successful verification, `createSession(ip)` executes an atomic `MULTI/EXEC` pipeline against DragonFly:
+
+```
+SET cap:sess:{uuid}     "50"  EX 120
+SET cap:sess-ip:{uuid}  "<ip>" EX 120
+```
+
+Both keys share the same TTL and are set atomically. The UUID returned becomes the `cap_session` cookie value.
+
+<Note>
+  The IP stored in `cap:sess-ip:{id}` is read from `captchaSessionIp(request)`, which calls `getTrustedClientIp` — it reads `CF-Connecting-IP` (Cloudflare) or the configured trusted proxy header. It never reads `X-Forwarded-For` directly to prevent spoofing.
+</Note>
+
+## Error responses
+
+| Status | Body `error` field | Cause |
+|---|---|---|
+| `400` | `invalid_body` | Request body is not valid JSON |
+| `403` | `trusted_ip_required` | `CF-Connecting-IP` (or trusted proxy header) is absent |
+| `404` | `captcha_disabled` | `CAP_API_URL` not set or DragonFly unavailable |
+| `429` | `rate_limited` | Exceeded `CAP_REDEEM_MAX_PER_MINUTE` in the current window |
+| `502` | `captcha_unreachable` | Cap server did not respond within `CAP_HTTP_TIMEOUT_MS` |
+| `503` | `voter_id_secret_missing` | `VOTER_ID_SECRET` (and `ORIGIN_GUARD_SECRET`) are both unset in production |
+| `503` | `rate_limit_unavailable` | DragonFly threw while incrementing the abuse counter |
+
+## Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CAP_API_URL` | _(unset)_ | Base URL of the Cap standalone server. Required for captcha to be active. |
+| `VOTER_ID_SECRET` | _(unset)_ | HMAC key for signing the `voter_id` cookie. Required in production. |
+| `ORIGIN_GUARD_SECRET` | _(unset)_ | Fallback HMAC key if `VOTER_ID_SECRET` is not set. |
+| `CAP_VOTES_PER_SESSION` | `50` | Vote quota granted per solved captcha. |
+| `CAP_SESSION_HARD_VOTE_CAP` | `50` | Hard upper bound on vote quota (effective quota = `min` of both). |
+| `CAP_SESSION_TTL_SECONDS` | `120` | Session lifetime in seconds (reset on each accepted vote). |
+| `CAP_REDEEM_MAX_PER_MINUTE` | `12` | Per-IP redeem rate limit. |
+| `CAP_HTTP_TIMEOUT_MS` | `5000` | Hard timeout (ms) for the server-to-Cap fetch. |

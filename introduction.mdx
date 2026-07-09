@@ -1,0 +1,59 @@
+---
+title: "Mundial de Clicks: Real-Time Voting at Internet Scale"
+sidebarTitle: "Introduction"
+description: "Mundial de Clicks is an open-source real-time click-voting app for the World Cup. Built with Astro SSR, DragonFly, SSE, and a single Lua script for atomic vote processing."
+---
+
+Mundial de Clicks is a real-time web app where users click to vote for their national football team and watch a live global ranking update instantly across every connected browser. What makes it interesting from an engineering standpoint is not the UI — it's the infrastructure decisions that let a single Node.js process absorb a wave of internet traffic without falling over: atomic counters instead of row-per-vote writes, a single shared polling loop that costs the same whether one person or fifty thousand are watching, and a Lua script that collapses rate-limiting, daily caps, and vote writes into one network round-trip.
+
+## Core Technical Innovations
+
+The two decisions that define the architecture are:
+
+**Atomic Lua script for votes.** Every `POST /api/vote` runs a single Lua script loaded into DragonFly via `EVALSHA`. In one atomic server-side execution it validates the captcha session and its IP binding, runs a token-bucket rate limit per IP, checks the daily vote cap per IP and `voter_id`, increments the `votes:ranking` sorted set via `ZINCRBY`, and updates `votes:total`, the per-second CPM bucket, and `votes:blocked`. Because Lua scripts in Redis-protocol stores are atomic, there are zero race conditions and exactly one network round-trip per vote batch regardless of how many countries are in the batch.
+
+**Single poller for all SSE subscribers.** A `WorldState` singleton runs one `setInterval` tick per second. Each tick calls `readWorld()`, which issues a single pipelined DragonFly command (`ZRANGE` + `GET total` + `GET blocked` + `MGET` of 60 CPM buckets). The resulting `WorldSnapshot` is serialized to JSON exactly once, encoded to a `Uint8Array`, and broadcast as the same bytes to every active SSE connection. The read cost is O(1) regardless of viewer count — one DragonFly pipeline per second, always.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Real-Time SSE Ranking" icon="satellite-dish">
+    The global ranking streams live to every browser via Server-Sent Events. The same serialized snapshot is pushed to all subscribers simultaneously — no per-viewer reads or serialization.
+  </Card>
+  <Card title="Atomic DragonFly Counters" icon="bolt">
+    Votes land as `ZINCRBY` and `INCRBY` calls on DragonFly's in-memory sorted set and integer counters. No rows, no locks, no contention — just atomic increments that DragonFly snapshots to disk every five minutes.
+  </Card>
+  <Card title="Cap PoW Captcha" icon="shield-halved">
+    Cap.js provides a Proof-of-Work captcha that runs invisibly in a WASM worker on the first vote. Sessions are bound to the creating IP in DragonFly and carry a configurable vote quota before requiring re-verification.
+  </Card>
+  <Card title="Daily Vote Limits" icon="calendar-day">
+    Each IP and `voter_id` cookie is capped at a configurable number of votes per UTC day (default: 2,000). Limits are enforced inside the same Lua script — no extra round-trips.
+  </Card>
+  <Card title="Optimistic UI with Reconciliation" icon="arrow-rotate-left">
+    Clicks update the local ranking instantly without waiting for a server response. When the SSE snapshot arrives, the client reconciles monotonically — vote counts only ever go up, preventing UI flicker from partial batches.
+  </Card>
+  <Card title="In-Memory Fallback for Dev" icon="memory">
+    When neither `REDIS_URL` nor `DRAGONFLY_HOST` is set, `hasDragonfly` is `false` and all vote operations fall back to an in-process `Map`. The full UI works without Docker — useful for pure frontend development.
+  </Card>
+  <Card title="Coolify Deployment" icon="cloud-arrow-up">
+    The project is designed to deploy on Coolify as three independent services — the Astro app, a DragonFly database, and an Umami analytics instance — connected only through environment variables.
+  </Card>
+  <Card title="Cloudflare IP Handling" icon="globe">
+    In production, all rate-limiting and captcha session binding use `CF-Connecting-IP`, not `X-Forwarded-For`. An optional `ORIGIN_GUARD_SECRET` header (set via a Cloudflare Transform Rule) prevents direct-origin spoofing.
+  </Card>
+</CardGroup>
+
+<Note>
+  Mundial de Clicks is designed for the **2026 FIFA World Cup**. The 16 countries configured as Round of 16 participants are: Argentina, Belgium, Brazil, Canada, Colombia, Egypt, Spain, USA, France, England, Morocco, Mexico, Norway, Paraguay, Portugal, and Switzerland.
+</Note>
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Framework | Astro 5 — `output: 'server'` with `@astrojs/node` standalone adapter |
+| Database | DragonFly — Redis-protocol in-memory store with 5-minute snapshot persistence |
+| Language | TypeScript (strict), with Lua scripts embedded for atomic DragonFly operations |
+| Styling | Tailwind CSS v4 via `@tailwindcss/vite` + Geist Pixel font |
+| Captcha | Cap.js (`@cap.js/server`, `@cap.js/wasm`, `@cap.js/widget`) — self-hosted PoW |
+| Analytics | Umami — self-hosted, injected via `PUBLIC_UMAMI_SCRIPT_URL` / `PUBLIC_UMAMI_WEBSITE_ID` build-time variables |

@@ -1,0 +1,124 @@
+---
+title: "Securing Mundial de Clicks Behind Cloudflare"
+sidebarTitle: "Security"
+description: "Configure origin guard secrets, Cloudflare IP headers, and voter ID signing to protect your Mundial de Clicks deployment from spoofing and abuse."
+---
+
+Mundial de Clicks is designed to run **behind Cloudflare** in production. The security model relies on two secrets — `ORIGIN_GUARD_SECRET` and `VOTER_ID_SECRET` — combined with Cloudflare's trusted IP header to protect the origin against direct access, IP spoofing, and daily-limit resets. This page explains each protection layer and how to configure them together.
+
+## Cloudflare IP Extraction
+
+When a request arrives through Cloudflare, the edge injects the real client IP in the `CF-Connecting-IP` header. Mundial de Clicks reads this header in `getCloudflareClientIp()` and uses it as the authoritative client identity for rate limiting and daily vote caps. In production the app **only** trusts `CF-Connecting-IP` — it does not fall back to `X-Forwarded-For`, which can be spoofed by clients. In local development (non-production `NODE_ENV`) it additionally accepts `X-Real-IP` from a local reverse proxy.
+
+```typescript
+export function getClientIp(request: Request, fallback = '0.0.0.0'): string {
+  const cfIp = getCloudflareClientIp(request);
+  if (cfIp) return cfIp;
+
+  // Local development only — not used in production.
+  if (process.env.NODE_ENV !== 'production') {
+    return sanitizeIp(request.headers.get('x-real-ip')?.trim() ?? '', fallback);
+  }
+
+  return fallback;
+}
+```
+
+<Warning>
+  If the origin server is publicly reachable (not exclusively behind Cloudflare), any client can send a forged `CF-Connecting-IP` header and bypass IP-based rate limits. **Restrict inbound traffic to [Cloudflare's IP ranges](https://www.cloudflare.com/ips/) at the firewall or proxy level** to ensure only genuine Cloudflare edge traffic reaches the origin.
+</Warning>
+
+## ORIGIN_GUARD_SECRET
+
+The origin guard is a shared secret header check that prevents attackers from bypassing Cloudflare by hitting the origin server directly. When `ORIGIN_GUARD_SECRET` is set, the Astro middleware rejects every non-health request that does not carry the correct `x-origin-guard` header value. Because Cloudflare is the only system that knows this secret (via a Transform Rule), direct requests to the origin receive a **403 Forbidden** response.
+
+**How it works in the middleware (`src/middleware.ts`):**
+
+```typescript
+if (
+  config.security.originGuardSecret &&
+  pathname !== '/api/health' &&
+  request.headers.get('x-origin-guard') !== config.security.originGuardSecret
+) {
+  return new Response('Forbidden', { status: 403 });
+}
+```
+
+The `/api/health` path is explicitly excluded so that Coolify's health checks continue to work even when the guard is active.
+
+**Step 1 — Set the secret in Coolify:**
+
+```bash
+ORIGIN_GUARD_SECRET=your-long-random-secret
+```
+
+**Step 2 — Create a Cloudflare Transform Rule:**
+
+In the Cloudflare dashboard, go to **Rules → Transform Rules → Modify Request Header** and create a rule with:
+
+- **Expression:** `http.request.uri.path ne "/api/health"`
+- **Action:** Set static header
+  - **Header name:** `x-origin-guard`
+  - **Value:** `your-long-random-secret` *(same value as the env var)*
+
+<Tip>
+  Generate a secure secret with `openssl rand -base64 32`. Use the same output for both the Coolify env var and the Cloudflare Transform Rule value.
+</Tip>
+
+## VOTER_ID_SECRET
+
+The `voter_id` cookie is a **persistent browser identity** used as a secondary daily vote cap alongside the IP-based cap. It is an HMAC-SHA256-signed UUID that survives browser sessions (180-day `Max-Age`) and is tied to a unique voter identity rather than a network address. This makes it harder to reset daily limits by simply reconnecting or switching networks.
+
+**Cookie format:** `{uuid}.{base64url-hmac-sha256-signature}`
+
+The signing and verification logic from `src/lib/voter-id.ts`:
+
+```typescript
+function sign(id: string): string {
+  return createHmac('sha256', secret()).update(id).digest('base64url');
+}
+```
+
+Verification uses `timingSafeEqual` to prevent timing attacks during signature comparison.
+
+**Secret resolution order:**
+
+1. `VOTER_ID_SECRET` (if set)
+2. `ORIGIN_GUARD_SECRET` (fallback, if `VOTER_ID_SECRET` is not set)
+3. `'dev-voter-id-secret'` (development only, when `NODE_ENV !== 'production'`)
+
+<Warning>
+  **Keep `VOTER_ID_SECRET` stable across deploys.** Rotating this secret invalidates every existing `voter_id` cookie — all daily vote counts tied to voter identities reset, and returning voters are treated as new. Set it once and do not change it unless you explicitly want to reset voter state.
+</Warning>
+
+## IP Sanitization
+
+All IP values extracted from request headers are sanitized before being used as DragonFly key components (e.g. `rl:{ip}:{window}`). The sanitization:
+
+- Truncates the value to **45 characters** (the maximum length of an IPv6 address)
+- Accepts only valid **IPv4** (`\d{1,3}.\d{1,3}.\d{1,3}.\d{1,3}`) or **IPv6** (`[0-9a-fA-F:]+`) patterns
+- Falls back to the configured fallback IP (default `0.0.0.0`) for any value that does not match
+
+This prevents malformed or adversarial header values from generating oversized or structurally unexpected Redis keys, protecting DragonFly from key-injection abuse even when the origin accidentally receives a crafted header.
+
+## Production Checklist
+
+Before exposing a Mundial de Clicks deployment to public traffic, verify every item in this checklist:
+
+<Steps>
+  <Step title="Restrict origin to Cloudflare IPs">
+    Configure your server firewall, Coolify network policy, or upstream proxy to only accept inbound HTTP/S connections from [Cloudflare's published IP ranges](https://www.cloudflare.com/ips/). This is the foundation that makes all header-based protections meaningful.
+  </Step>
+  <Step title="Set ORIGIN_GUARD_SECRET and configure Cloudflare Transform Rule">
+    Set `ORIGIN_GUARD_SECRET` in the Coolify environment, then create a Cloudflare Transform Rule to inject `x-origin-guard: <secret>` on all requests except `/api/health`. Test by hitting the origin IP directly — you should receive a 403.
+  </Step>
+  <Step title="Set VOTER_ID_SECRET to a stable value">
+    Generate a secret with `openssl rand -base64 32`, set it as `VOTER_ID_SECRET` in Coolify, and treat it as permanent. Document it in your secrets manager so it is not accidentally rotated during a redeploy.
+  </Step>
+  <Step title="Configure CAP_API_URL (captcha required in production)">
+    Set `CAP_API_URL` to point to your Cap standalone server. Without it, `hasCaptcha` is `false` and `POST /api/vote` returns **503** in production. Both DragonFly (`REDIS_URL`) and `CAP_API_URL` must be set for the vote API to accept requests.
+  </Step>
+  <Step title="Set REDIS_URL to the internal DragonFly service name">
+    In Coolify, point `REDIS_URL` at the internal service name of your DragonFly resource (e.g. `redis://dragonfly:6379`). Using the internal name keeps traffic off the public internet and avoids the need for an externally exposed Redis port.
+  </Step>
+</Steps>

@@ -1,0 +1,138 @@
+---
+title: "Deploy Mundial de Clicks on Coolify with DragonFly and Umami"
+sidebarTitle: "Coolify"
+description: "Step-by-step guide to deploying the full Mundial de Clicks stack on a VPS using Coolify: app, DragonFly database, and optional Umami analytics."
+---
+
+Coolify is the recommended deployment platform for Mundial de Clicks. The stack is composed of three independent services — the Astro SSR app, a DragonFly database, and an optional Umami analytics instance — wired together exclusively through environment variables. No code changes are required to move between environments.
+
+<Steps>
+
+### Add DragonFly
+
+In your Coolify dashboard, click **+ New → Database → DragonFly**. Coolify will provision a DragonFly container and assign it an internal service name (e.g. `dragonfly`). That name becomes the hostname in your `REDIS_URL`.
+
+<Note>
+  Write down the internal service name before continuing. You will need it in
+  the next step when setting `REDIS_URL=redis://<service-name>:6379`.
+</Note>
+
+### Deploy the app
+
+Click **+ New → Public Repository** and paste `https://github.com/midudev/mundial-de-clicks`. Coolify will detect the `Dockerfile` automatically and use it to build the image.
+
+Set the following environment variables on the app service:
+
+| Variable | Example value | Required |
+| :--- | :--- | :--- |
+| `REDIS_URL` | `redis://dragonfly:6379` | ✅ Yes |
+| `CAP_API_URL` | `https://cap.example.com/site-key` | ✅ Yes (captcha) |
+| `HOST` | `0.0.0.0` | ✅ Yes |
+| `PORT` | `4321` | Recommended |
+| `ORIGIN_GUARD_SECRET` | `<long-random-string>` | Recommended |
+| `VOTER_ID_SECRET` | `<long-random-string>` | Recommended |
+| `RATE_LIMIT_MAX` | `5` | Optional |
+| `CAP_VOTES_PER_SESSION` | `50` | Optional |
+| `DAILY_VOTE_MAX_PER_IP` | `2000` | Optional |
+| `STREAM_INTERVAL_MS` | `1000` | Optional |
+| `MAX_SSE_CONNECTIONS_PER_IP` | `4` | Optional |
+
+<Tip>
+  `VOTER_ID_SECRET` is used to sign the persistent `voter_id` cookie that
+  tracks daily vote limits per browser. Keep this value stable across
+  redeploys — changing it resets every visitor's daily limit counter.
+</Tip>
+
+### Configure the health check
+
+Point Coolify's health check to `GET /api/health`. This endpoint returns `200 OK` with the body `OK` and touches no external dependencies (no DragonFly call, no database query). Coolify uses it to decide when the Node server is alive and ready to receive traffic.
+
+```text
+GET /api/health
+→ 200 OK  (text/plain, cache-control: no-store)
+```
+
+### (Optional) Add Umami analytics
+
+Click **+ New → Service → Umami** to deploy the one-click Umami template. Once it starts, log in, create a website entry, and copy the **Website ID** and the **script URL**.
+
+Add both values to the app service as **build arguments** (not runtime env vars):
+
+| Build arg | Example value |
+| :--- | :--- |
+| `PUBLIC_UMAMI_SCRIPT_URL` | `https://umami.example.com/script.js` |
+| `PUBLIC_UMAMI_WEBSITE_ID` | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
+
+<Warning>
+  `PUBLIC_UMAMI_SCRIPT_URL` and `PUBLIC_UMAMI_WEBSITE_ID` are **baked into the
+  JavaScript bundle at build time** by Vite. Adding or changing them requires
+  you to trigger a full redeploy of the app service — a restart alone is not
+  enough.
+</Warning>
+
+After saving the build args, click **Redeploy** on the app service to pick them up.
+
+</Steps>
+
+## Full environment variable reference
+
+The table below covers every variable understood by the app. In local development all of them are optional — defaults point to `localhost:6379`. In Coolify, set the ones marked **Required** or **Recommended** at minimum.
+
+| Variable | Default | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `REDIS_URL` | `redis://localhost:6379` | ✅ Yes | Full DragonFly connection URL. Takes priority over individual `DRAGONFLY_*` vars. |
+| `DRAGONFLY_HOST` | `localhost` | No | Ignored when `REDIS_URL` is set. |
+| `DRAGONFLY_PORT` | `6379` | No | Ignored when `REDIS_URL` is set. |
+| `DRAGONFLY_PASSWORD` | — | No | Ignored when `REDIS_URL` is set. |
+| `REDIS_COMMAND_TIMEOUT_MS` | `2000` | No | Hard timeout per DragonFly command in ms. Fail-fast guard. |
+| `HOST` | `0.0.0.0` | ✅ Yes | Bind address for the Node server. Must be `0.0.0.0` in containers. |
+| `PORT` | `4321` | Recommended | Port the Node server listens on. |
+| `ORIGIN_GUARD_SECRET` | — | Recommended | If set, every non-health request must carry `x-origin-guard: <value>`. Configure via Cloudflare Transform Rule. |
+| `VOTER_ID_SECRET` | — | Recommended | HMAC secret for signing the persistent `voter_id` cookie. Falls back to `ORIGIN_GUARD_SECRET`. |
+| `CAP_API_URL` | — | ✅ Yes | Cap standalone server URL including site key path. Captcha is disabled when empty. |
+| `CAP_VOTES_PER_SESSION` | `50` | No | Votes allowed per solved captcha session before a new challenge is required. |
+| `CAP_SESSION_HARD_VOTE_CAP` | `50` | No | Hard ceiling on votes per Cap session regardless of `CAP_VOTES_PER_SESSION`. |
+| `CAP_SESSION_TTL_SECONDS` | `120` | No | Maximum lifetime of a verified captcha session in seconds. |
+| `CAP_CHALLENGE_MAX_PER_MINUTE` | `6` | No | Maximum Cap challenge requests per IP per minute. |
+| `CAP_REDEEM_MAX_PER_MINUTE` | `12` | No | Maximum Cap redeem requests per IP per minute. |
+| `CAP_CHALLENGE_DIFFICULTY_BASE` | `4` | No | Base PoW difficulty for Cap challenges. |
+| `CAP_CHALLENGE_DIFFICULTY_MAX` | `8` | No | Maximum PoW difficulty for Cap challenges. |
+| `CAP_CHALLENGE_DIFFICULTY_STEP_VOTES` | `250` | No | Daily votes per IP at which difficulty increases by one step. |
+| `CAP_HTTP_TIMEOUT_MS` | `5000` | No | Timeout in ms for server-to-server requests to the Cap server. |
+| `RATE_LIMIT_MAX` | `5` | No | Maximum valid votes per IP per window. |
+| `RATE_LIMIT_WINDOW` | `1` | No | Rate-limit window size in seconds. |
+| `DAILY_VOTE_MAX_PER_IP` | `2000` | No | Daily vote ceiling per IP (UTC day). Votes beyond this are silently dropped. |
+| `STREAM_INTERVAL_MS` | `1000` | No | Milliseconds between SSE ranking snapshots pushed to clients. |
+| `MAX_SSE_CONNECTIONS` | `20000` | No | Global ceiling on concurrent SSE connections. |
+| `MAX_SSE_CONNECTIONS_PER_IP` | `4` | No | Per-IP ceiling on concurrent SSE connections. |
+| `RANKING_MIN_REFRESH_MS` | `750` | No | Minimum age in ms between forced refreshes via `/api/ranking`. |
+| `PUBLIC_UMAMI_SCRIPT_URL` | — | No | Umami tracking script URL. **Build-time arg** — requires redeploy on change. |
+| `PUBLIC_UMAMI_WEBSITE_ID` | — | No | Umami website UUID. **Build-time arg** — requires redeploy on change. |
+
+## Production security tips
+
+<CardGroup cols={2}>
+  <Card title="Restrict origin to Cloudflare IPs" icon="shield">
+    Configure your VPS firewall (or Coolify's port rules) to accept inbound
+    HTTP(S) traffic only from [Cloudflare's published IP ranges](https://www.cloudflare.com/ips/).
+    This prevents attackers from bypassing Cloudflare's DDoS protection and
+    rate-limiting by hitting the origin directly.
+  </Card>
+  <Card title="Use x-origin-guard" icon="key">
+    Set `ORIGIN_GUARD_SECRET` to a long random value, then create a Cloudflare
+    **Transform Rule** (Modify Request Header) that injects
+    `x-origin-guard: <your-secret>` on every request to your origin. The app
+    rejects any request that arrives without this header.
+  </Card>
+  <Card title="Use CF-Connecting-IP for real IPs" icon="globe">
+    In production, the app reads the client IP from the `CF-Connecting-IP`
+    header injected by Cloudflare. Ensure your Coolify proxy forwards this
+    header and that the origin is not reachable without it.
+    `X-Forwarded-For` is not used as a trusted IP source.
+  </Card>
+  <Card title="Deploy Cap as a separate service" icon="robot">
+    Use the Cap standalone Docker image as an additional Coolify service and
+    set `CAP_API_URL` to its internal URL plus the site key path. Keeping Cap
+    on the same private network avoids public CORS concerns and reduces latency.
+  </Card>
+</CardGroup>

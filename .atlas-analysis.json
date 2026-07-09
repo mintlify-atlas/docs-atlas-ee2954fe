@@ -1,0 +1,102 @@
+{
+  "projectType": "saas",
+  "projectName": "Mundial de Clicks",
+  "projectDescription": "A real-time click-voting web app where users support their national team by clicking, with live rankings synced globally and infrastructure designed to handle massive concurrent traffic.",
+  "theme": "luma",
+  "primaryColor": "#10b981",
+  "lightColor": "#d1fae5",
+  "darkColor": "#065f46",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment-variables",
+              "configuration/features",
+              "configuration/security"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/coolify",
+              "deployment/docker",
+              "deployment/dragonfly"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/anti-abuse",
+              "guides/captcha",
+              "guides/analytics"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Voting",
+            "pages": [
+              "api/vote",
+              "api/ranking",
+              "api/stream"
+            ]
+          },
+          {
+            "group": "Captcha",
+            "pages": [
+              "api/captcha-session",
+              "api/captcha-challenge",
+              "api/captcha-redeem"
+            ]
+          },
+          {
+            "group": "System",
+            "pages": [
+              "api/health",
+              "api/status"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Real-time global ranking via Server-Sent Events (SSE)",
+    "Atomic vote processing with a single Lua script (rate limit + write in one Redis round-trip)",
+    "Sliding-window clicks-per-minute counter using per-second DragonFly buckets",
+    "Cap proof-of-work captcha integration with progressive difficulty",
+    "Daily vote limits per IP and per signed voter_id cookie",
+    "Batched click submissions from the client to minimize request volume",
+    "Optimistic UI with server reconciliation",
+    "Zero-dependency in-memory fallback mode for local development without DragonFly",
+    "Coolify one-click deployment with DragonFly, Umami analytics, and Postgres",
+    "Cloudflare-aware IP extraction (CF-Connecting-IP) with origin guard secret",
+    "Live event detection: overtakes, milestones, and leader changes",
+    "Multi-stage Docker build with minimal production runtime image"
+  ],
+  "publicApiSurface": [
+    "POST /api/vote — submit a batch of votes for one or more countries",
+    "GET /api/ranking — fetch current ranking snapshot",
+    "GET /api/stream — SSE stream delivering WorldSnapshot updates",
+    "GET /api/captcha/session — check whether captcha is required and session is valid",
+    "POST /api/captcha/challenge — proxy to Cap standalone server for a PoW challenge",
+    "POST /api/captcha/redeem — proxy to Cap server to redeem a solved challenge and create a session cookie",
+    "GET /api/health — health check endpoint for Coolify/Traefik",
+    "GET /api/status — feature flags status (DragonFly, captcha, Umami)"
+  ]
+}

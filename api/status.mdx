@@ -1,0 +1,83 @@
+---
+title: "GET /api/status — Feature Flags and Integration Status"
+sidebarTitle: "GET /status"
+description: "GET /api/status returns which integrations are active: DragonFly persistence, Cap captcha, Umami analytics, and the active vote store type."
+---
+
+`GET /api/status` reports the runtime state of all three optional integrations. The web UI calls this endpoint on load to display visual banners when features are not configured, so developers and operators can see at a glance which services are connected without inspecting environment variables directly. The response is computed from module-level boolean constants (`hasDragonfly`, `hasCaptcha`, `hasUmami`) that are evaluated once at startup, making this endpoint synchronous and zero-I/O.
+
+## Request
+
+```http
+GET /api/status HTTP/1.1
+```
+
+No parameters, no authentication, no cookies required.
+
+## Response
+
+**Status**: `200 OK`
+
+```json
+{
+  "dragonfly": true,
+  "captcha": true,
+  "umami": false,
+  "store": "redis"
+}
+```
+
+<ResponseField name="dragonfly" type="boolean" required>
+  `true` when at least one of `REDIS_URL` or `DRAGONFLY_HOST` is set to a non-empty value. Indicates that vote counts, daily limits, captcha sessions, and abuse limits are persisted in DragonFly. When `false`, all data lives in a per-process in-memory store — useful for demos and local development, but votes are lost on every restart and not shared across multiple Node instances.
+</ResponseField>
+
+<ResponseField name="captcha" type="boolean" required>
+  `true` when `CAP_API_URL` is set **and** `dragonfly` is `true`. Both conditions must hold because captcha sessions (`cap:sess:*` keys) require DragonFly storage. Setting `CAP_API_URL` without DragonFly would silently leave the captcha in a broken state; the app prevents this by tying `hasCaptcha` to `hasDragonfly`.
+</ResponseField>
+
+<ResponseField name="umami" type="boolean" required>
+  `true` when both `PUBLIC_UMAMI_SCRIPT_URL` and `PUBLIC_UMAMI_WEBSITE_ID` were defined **at build time**. These are Astro `PUBLIC_*` variables read from `import.meta.env` during the Astro SSR build — changing them in the runtime environment without rebuilding has no effect. When `false`, the Umami `<script>` tag is not injected into any page.
+</ResponseField>
+
+<ResponseField name="store" type="string" required>
+  Either `"redis"` (DragonFly is active) or `"memory"` (in-process demo store). Mirrors the `dragonfly` flag as a human-readable string for display in dashboards and UI banners.
+</ResponseField>
+
+## Feature dependency map
+
+```
+REDIS_URL or DRAGONFLY_HOST set?
+  └─ dragonfly: true
+       └─ store: "redis"
+       └─ CAP_API_URL set?
+            └─ captcha: true
+
+PUBLIC_UMAMI_SCRIPT_URL + PUBLIC_UMAMI_WEBSITE_ID set at build time?
+  └─ umami: true
+```
+
+<Info>
+  `umami` is the only field that depends on build-time variables. All other fields are evaluated at server startup from runtime environment variables. This means you can enable or disable DragonFly and captcha with a container restart, but toggling Umami requires a new deployment.
+</Info>
+
+## Use cases
+
+**Local development** — run the app without any external services and confirm all three flags are `false`. Add each service one at a time and reload `/api/status` to verify the flag flips correctly before testing the full flow.
+
+**Production monitoring** — poll this endpoint from a healthcheck dashboard (e.g. Uptime Kuma) and alert when `dragonfly: false` unexpectedly, which would indicate the DragonFly container stopped and votes are falling back to the in-memory store.
+
+**UI warnings** — the frontend reads this response on page load and displays contextual banners (e.g. "Captcha is not configured — votes are unprotected") so operators are notified without needing to check logs or environment variables.
+
+<Warning>
+  This endpoint is unauthenticated and reveals which integrations are active. In production, the app is typically fronted by Cloudflare, which limits exposure. If you run the origin server on a publicly routable address without Cloudflare, consider adding the `x-origin-guard` check to this endpoint or restricting access by IP allowlist at the Traefik/Coolify level.
+</Warning>
+
+## Environment variables
+
+| Variable | Scope | Effect on `/api/status` |
+|---|---|---|
+| `REDIS_URL` | Runtime | Sets `dragonfly: true` and `store: "redis"` |
+| `DRAGONFLY_HOST` | Runtime | Alternative to `REDIS_URL`; same effect |
+| `CAP_API_URL` | Runtime | Sets `captcha: true` (requires `dragonfly: true`) |
+| `PUBLIC_UMAMI_SCRIPT_URL` | **Build time** | Required for `umami: true` |
+| `PUBLIC_UMAMI_WEBSITE_ID` | **Build time** | Required for `umami: true` |

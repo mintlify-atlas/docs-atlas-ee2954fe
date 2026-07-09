@@ -1,0 +1,112 @@
+---
+title: "How Mundial de Clicks Handles Internet-Scale Traffic"
+sidebarTitle: "Architecture"
+description: "Explore the vote pipeline from browser click to DragonFly write to SSE broadcast. One Lua script, one poller, zero per-viewer overhead."
+---
+
+The core challenge in Mundial de Clicks is straightforward to state and hard to get right: millions of clicks arriving simultaneously from a global audience, all of which need to update a shared ranking and be visible to every viewer within about a second — on a single Node.js server with no horizontal scaling. The solution is not clever caching or a queue — it is eliminating per-request and per-viewer work at the architecture level, so that the hot path stays flat regardless of traffic.
+
+## Vote Pipeline
+
+Every click travels through a fixed sequence of steps before it appears in someone else's browser:
+
+```
+Browser click
+     ↓
+Client batches (400ms window, max 10 votes / 3 countries)
+     ↓
+POST /api/vote
+     ↓
+Lua script (atomic):
+  0. Validate captcha session + IP binding
+  1. Token bucket rate limit per IP
+  2. Daily vote cap per IP + voter_id
+  3. ZINCRBY votes:ranking per country
+  4. INCRBY votes:total, cpm:{second}, votes:blocked
+     ↓
+WorldState poller (setInterval, 1s)
+     ↓
+readWorld() — ONE pipeline: ZRANGE + GET total + GET blocked + MGET 60 CPM buckets
+     ↓
+Detect overtakes + milestones → build WorldSnapshot
+     ↓
+Serialize once → broadcast same Uint8Array to all SSE subscribers
+```
+
+The client accumulates clicks in a `Map<string, number>` and flushes it every 400 ms (or when the map contains votes for 3 countries or 10 total votes). This means a user clicking at 20 clicks/second generates roughly 2–3 HTTP requests per second instead of 20. On the server, each request triggers one `EVALSHA` call to DragonFly — the Lua script does every check and every write atomically in that single call.
+
+On the read side, the `WorldState` singleton runs one `setInterval` at `config.stream.intervalMs` (default: 1 s). Each tick issues a single pipelined DragonFly read, serializes the result once, and fans out the same bytes to every SSE subscriber. No matter how many browsers are watching, the database sees exactly one read per second.
+
+## Key Design Decisions
+
+<AccordionGroup>
+  <Accordion title="Why a Lua script for votes?">
+    Running the entire vote pipeline — captcha session check, IP binding verification, token bucket rate limit, daily cap enforcement, ZINCRBY per country, INCRBY total/CPM/blocked — as a single Lua script loaded into DragonFly (via `SCRIPT LOAD` + `EVALSHA`) provides two critical properties.
+
+    **Atomicity.** Lua scripts in Redis-protocol stores execute atomically on the server. There is no window between reading the token bucket and decrementing it where another request can slip in. This eliminates the class of race conditions where two concurrent requests both read "5 tokens remaining" and both successfully consume them.
+
+    **One network round-trip.** The entire pipeline — read rate-limit state, compute allowed votes, write ranking increments, write CPM bucket, update blocked counter — happens in a single `EVALSHA` command. Compare this to a naive implementation that would require: GET token bucket → SET token bucket → ZINCRBY per country → INCRBY total → INCRBY CPM, each a separate round-trip. With typical LAN latency between the app and DragonFly, batching all of these into one Lua call is the primary reason the server can keep up with vote bursts.
+
+    The script SHA is cached after the first `SCRIPT LOAD` and reloaded automatically on `NOSCRIPT` errors (e.g., after a DragonFly restart).
+  </Accordion>
+
+  <Accordion title="Why one global poller?">
+    A naive SSE implementation spawns a database read per subscriber per tick. With 10,000 concurrent viewers and a 1-second interval, that is 10,000 DragonFly reads per second — for data that is identical for every viewer.
+
+    `WorldState` instead maintains a single `setInterval`. Each tick calls `readWorld()` once, builds a `WorldSnapshot`, serializes it to a `Uint8Array` exactly once, and calls `broadcast()` which iterates the subscriber `Set` and passes the same buffer reference to every connection. The cost profile is:
+
+    - **DragonFly reads:** 1 per second (constant)
+    - **JSON serializations:** 1 per second (constant)
+    - **Per-subscriber work:** one function call to write pre-encoded bytes to the SSE stream
+
+    Adding more viewers increases only the fan-out loop, which is trivially cheap. The poller also stays dormant when `subscribers.size === 0` — if nobody is watching, no DragonFly reads happen at all.
+  </Accordion>
+
+  <Accordion title="Why batched client clicks?">
+    SSE delivers the authoritative ranking, but clicks need to feel instant — there must be no visible lag between pressing a button and seeing the counter move. The solution is an optimistic local state: every click immediately updates the in-browser ranking, and a vote is queued in a `Map<string, number>`.
+
+    A 400 ms throttle window accumulates all clicks before flushing. At 20 clicks/second this reduces network requests by roughly 8×. The server enforces matching limits (`MAX_SEND_BATCH = 10`, `MAX_SEND_COUNTRIES = 3`), and any votes the server rejects — because they exceeded the rate limit — are reverted from the optimistic state via `revert(code, blocked)`. The net effect is that users see instant feedback, the server sees a manageable request rate, and the displayed numbers stay accurate once the SSE snapshot reconciles them.
+  </Accordion>
+
+  <Accordion title="Why snapshots not per-vote SSE?">
+    Pushing an SSE event on every accepted vote would create a thundering herd problem at scale: a burst of 1,000 votes per second means 1,000 serializations and 1,000 × N fan-out calls per second (where N is the viewer count). Costs grow as O(votes × viewers).
+
+    Snapshotting decouples vote throughput from broadcast cost entirely. The poller reads the accumulated state once per second regardless of how many votes landed in that interval. If nothing changed between two ticks, `WorldState` skips the broadcast entirely and only sends a `': ping\n\n'` comment every 20 seconds (`HEARTBEAT_MS`) to keep SSE connections alive through proxies and load balancers that close idle HTTP connections.
+
+    The snapshot approach also naturally smooths the ranking display — rapid individual vote increments are coalesced into a single position update per second, which is visually clean and avoids re-render storms in the browser.
+  </Accordion>
+</AccordionGroup>
+
+## DragonFly Key Schema
+
+| Key | Type | Description |
+|---|---|---|
+| `votes:ranking` | ZSET | Member = ISO country code, score = total accumulated votes. Read with `ZRANGE … REV` to get the ranking in descending order. |
+| `votes:total` | INT | Global count of all valid accepted votes across all countries. |
+| `votes:blocked` | INT | Cumulative count of clicks blocked by the rate limiter. Displayed in the admin stats view. |
+| `cpm:{epochSecond}` | INT | Votes accepted in that specific second. 60 consecutive keys are summed via `MGET` each tick to produce a sliding-window clicks-per-minute value. Keys expire after 70 seconds. |
+| `rl:{ip}` | HASH | Token bucket state per IP: fields `tokens` (current float) and `updated` (epoch ms). Consumed and refilled inside the Lua script. |
+| `cap:sess:{id}` | INT | Remaining vote quota for a captcha session. Decremented atomically by the Lua script; key is deleted when quota reaches zero. |
+| `cap:sess-ip:{id}` | STRING | The trusted IP that created the captcha session. The Lua script compares the current request IP against this value before accepting any votes. |
+| `daily:ip:{ip}:{day}` | INT | Votes cast by a given IP on the given UTC day (format `YYYY-MM-DD`). Expires at the next UTC midnight. |
+| `daily:voter:{id}:{day}` | INT | Votes cast by a given `voter_id` cookie on the given UTC day. Used alongside the IP limit — the stricter of the two applies. |
+
+## In-Memory Fallback
+
+When both `REDIS_URL` and `DRAGONFLY_HOST` are unset, the `hasDragonfly` flag in `src/lib/features.ts` evaluates to `false`. In this mode, `castVotes()` and `readWorld()` delegate to `castVotesMemory()` and `readWorldMemory()` respectively — implementations backed by plain in-process `Map` and number variables.
+
+This fallback is intentionally lightweight: it has no persistence (state is lost on server restart), no rate limiting, and no captcha enforcement. It exists so that frontend developers can run the full UI — voting buttons, live ranking animations, SSE stream, optimistic updates, reconciliation — without needing Docker or any external services. The feature status endpoint at `/api/status` exposes `store: 'memory'` when the fallback is active, so it is always visible in the UI which mode is running.
+
+## Feature Flags
+
+`src/lib/features.ts` exports three boolean flags that progressively enable functionality as environment variables are defined. No code changes are required — the app detects what is configured at startup.
+
+| Flag | Condition | Effect when `false` |
+|---|---|---|
+| `hasDragonfly` | `REDIS_URL` or `DRAGONFLY_HOST` is set and non-empty | Votes use the in-memory fallback store; no persistence |
+| `hasCaptcha` | `CAP_API_URL` is set **and** `hasDragonfly` is `true` | Voting requires no captcha; the PoW widget is hidden |
+| `hasUmami` | Both `PUBLIC_UMAMI_SCRIPT_URL` and `PUBLIC_UMAMI_WEBSITE_ID` are set at build time | The Umami `<script>` tag is not injected; no analytics collected |
+
+`hasCaptcha` depends on `hasDragonfly` because captcha sessions (`cap:sess:*` and `cap:sess-ip:*`) are stored in DragonFly. Running captcha without DragonFly would mean sessions could not be persisted or validated across requests.
+
+`hasUmami` reads from `import.meta.env` (Astro build-time environment), not `process.env`. Changing those variables requires a full rebuild and redeploy — they are baked into the compiled output at build time.

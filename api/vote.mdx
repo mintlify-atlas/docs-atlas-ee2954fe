@@ -1,0 +1,155 @@
+---
+title: "POST /api/vote — Submit a Batch of Votes"
+sidebarTitle: "POST /api/vote"
+description: "POST /api/vote accepts a batch of up to 10 votes across 3 countries. Returns accepted count, blocked count, rate limit state, and updated vote totals."
+---
+
+`POST /api/vote` is the core write endpoint for Mundial de Clicks. Rather than sending one HTTP request per click, the client accumulates clicks for up to 400 ms and dispatches them as a single batch — up to 10 votes across up to 3 countries. All rate-limit enforcement, captcha-session validation, and DragonFly counter increments happen atomically inside a single Lua script, so there are no partial writes or race conditions.
+
+## Authentication / Prerequisites
+
+In production (`NODE_ENV=production`), every request must carry a valid `cap_session` cookie issued by `POST /api/captcha/redeem`. If the cookie is absent, expired, or tied to a different IP, the endpoint returns **403** with `reason: "captcha_required"`.
+
+In development (captcha disabled via `CAP_API_URL` being empty), no session cookie is required — votes are processed directly.
+
+<Warning>
+  If the server is running in production mode but `CAP_API_URL` is not configured, the endpoint returns **503** `captcha_required` for every request. Configure the captcha service before deploying.
+</Warning>
+
+## Request
+
+**Method:** `POST`  
+**Content-Type:** `application/json`  
+**Body size limit:** 2048 bytes (hard limit, enforced by stream-reading — not trusted `Content-Length`)
+
+### Body Parameters
+
+<ParamField body="votes" type="object" required>
+  Map of country code → vote count. Keys are ISO 3166-1 alpha-2 lowercase codes. Maximum **3 distinct country codes** per request. Total votes across all countries must be **≤ 10**.
+
+  Invalid codes, non-integer values, and zero or negative counts are silently ignored during normalization. If the normalized total is 0 after filtering, the request is rejected with `invalid_payload`.
+</ParamField>
+
+#### Valid Country Codes
+
+The following codes correspond to the 16 nations competing in the Mundial de Clicks:
+
+| Code | Country | Code | Country |
+|------|---------|------|---------|
+| `ar` | Argentina | `ma` | Marruecos |
+| `be` | Bélgica | `mx` | México |
+| `br` | Brasil | `no` | Noruega |
+| `ca` | Canadá | `py` | Paraguay |
+| `co` | Colombia | `pt` | Portugal |
+| `eg` | Egipto | `ch` | Suiza |
+| `es` | España | `us` | USA |
+| `fr` | Francia | `en` | Inglaterra |
+
+#### Example Request
+
+```json
+{
+  "votes": {
+    "es": 5,
+    "ar": 3
+  }
+}
+```
+
+```typescript
+const res = await fetch('/api/vote', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ votes: { es: 5, ar: 3 } }),
+});
+```
+
+## Responses
+
+### 200 — Success
+
+All or part of the batch was accepted. Even when some votes were blocked by the rate limiter, the endpoint returns **200** (not 429) as long as at least one vote was accepted. Check `accepted` and `blocked` to reconcile optimistic UI state.
+
+```json
+{
+  "ok": true,
+  "counts": { "es": 1043, "ar": 892 },
+  "accepted": 8,
+  "blocked": 0,
+  "remaining": 2
+}
+```
+
+<ResponseField name="ok" type="boolean">
+  Always `true` on a 200 response.
+</ResponseField>
+
+<ResponseField name="counts" type="object">
+  Updated cumulative vote totals for each country included in the batch, keyed by country code. Only countries present in the request are returned.
+</ResponseField>
+
+<ResponseField name="accepted" type="number">
+  Number of votes from the batch that were written to DragonFly. Always ≤ the total requested.
+</ResponseField>
+
+<ResponseField name="blocked" type="number">
+  Number of votes from the batch that were rejected by the rate limiter. `accepted + blocked` equals the total votes sent.
+</ResponseField>
+
+<ResponseField name="remaining" type="number">
+  Remaining token-bucket capacity in the current rate-limit window after this request was processed.
+</ResponseField>
+
+### 429 — Rate Limited
+
+The entire batch was blocked — no votes were accepted. The client should wait at least `retryAfter` milliseconds before retrying.
+
+```json
+{
+  "ok": false,
+  "reason": "rate_limited",
+  "accepted": 0,
+  "blocked": 5,
+  "remaining": 0,
+  "retryAfter": 750
+}
+```
+
+<ResponseField name="retryAfter" type="number">
+  Milliseconds until the rate-limit window resets and the client may retry. Apply this as a cooldown in the UI to avoid hammering the endpoint.
+</ResponseField>
+
+### Error Responses
+
+| Status | `reason` | Description |
+|--------|----------|-------------|
+| `400` | `invalid_payload` | Malformed JSON, no valid votes after normalization, more than 3 distinct country codes, or total votes exceed 10. |
+| `403` | `captcha_required` | No `cap_session` cookie present, or the session has expired or is bound to a different IP. |
+| `413` | `payload_too_large` | Request body exceeds the 2048-byte hard limit. |
+| `429` | `rate_limited` | IP exceeded the rate-limit window. No votes were accepted. |
+| `500` | `error` | Internal server error — typically a DragonFly connection failure or Lua script error. |
+| `503` | `captcha_required` | Server is running in production mode but `CAP_API_URL` is not configured. |
+
+## Client Usage
+
+The following is the actual implementation from `src/scripts/api.ts`. It wraps the fetch call and returns a typed `VoteResponse`, falling back to `{ ok: false, reason: "error" }` on network failure so the caller always receives a consistent shape.
+
+```typescript
+async function sendVotes(votes: Map<string, number>): Promise<VoteResponse> {
+  const res = await fetch('/api/vote', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ votes: Object.fromEntries(votes) }),
+    keepalive: true,
+  });
+  return (await res.json()) as VoteResponse;
+}
+```
+
+<Note>
+  The client flushes its pending-vote accumulator every **400 ms** (`FLUSH_MS`). Clicks that arrive during an in-flight request are held in the `pending` map and sent in the next flush. This means 20 rapid clicks produce at most 1–2 requests per second, not 20 — substantially reducing both server load and DragonFly write pressure.
+</Note>
+
+<Tip>
+  When `accepted < total requested`, the difference was silently blocked by the rate limiter. The client reconciles its optimistic UI by calling `revert(code, blocked)` for each country in the batch, in the same order the Lua script processed them, so the displayed vote counts never drift permanently above the server's authoritative totals.
+</Tip>

@@ -1,0 +1,179 @@
+---
+title: "Build and Run Mundial de Clicks with Docker"
+sidebarTitle: "Docker"
+description: "Run the full stack locally or on any host using Docker Compose. Includes the Astro app, DragonFly, Postgres, and Umami analytics services."
+---
+
+The repository ships a multi-stage `Dockerfile` and a `docker-compose.yml` that bring up the complete infrastructure — DragonFly, Postgres, and Umami — with a single command. The Astro app runs alongside those services in development and is packaged as its own container for production.
+
+## Docker Compose services
+
+The `docker-compose.yml` defines three infrastructure services. The Astro app itself is not included in the Compose file: in development you run it with `pnpm dev`; in production you build and run its own image separately (or let Coolify manage it).
+
+| Service | Image | Exposed port | Purpose |
+| :--- | :--- | :--- | :--- |
+| `dragonfly` | `docker.dragonflydb.io/dragonflydb/dragonfly:latest` | `6379` | Vote storage — Redis-compatible in-memory database |
+| `postgres` | `postgres:16-alpine` | internal only | Relational store required by Umami |
+| `umami` | `ghcr.io/umami-software/umami:postgresql-latest` | `3001` | Self-hosted web analytics dashboard |
+
+## Local development
+
+<Steps>
+
+### Start all services
+
+Launch DragonFly, Postgres, and Umami in the background:
+
+```bash
+docker compose up -d
+```
+
+Umami will be available at `http://localhost:3001` (default credentials: `admin` / `umami`).
+
+### (Optional) Start DragonFly only
+
+If you don't need analytics locally, bring up only the vote database:
+
+```bash
+docker compose up -d dragonfly
+```
+
+### Run the app
+
+```bash
+pnpm dev
+```
+
+Open `http://localhost:4321`. No environment variables are required — the defaults in `.env.example` already point to `localhost:6379`.
+
+</Steps>
+
+## Building the production image
+
+The `Dockerfile` uses a two-stage build to keep the final image small.
+
+**Stage 1 — build** (`node:22-alpine`)
+
+Installs all dependencies via `pnpm` (respecting `pnpm-lock.yaml`), then accepts two optional build arguments that Vite bakes into the JavaScript bundle at compile time:
+
+```dockerfile
+ARG PUBLIC_UMAMI_SCRIPT_URL=""
+ARG PUBLIC_UMAMI_WEBSITE_ID=""
+ENV PUBLIC_UMAMI_SCRIPT_URL=$PUBLIC_UMAMI_SCRIPT_URL
+ENV PUBLIC_UMAMI_WEBSITE_ID=$PUBLIC_UMAMI_WEBSITE_ID
+```
+
+If these args are omitted, the Umami tracking script is simply not injected into the HTML.
+
+**Stage 2 — runtime** (`node:22-alpine`)
+
+Copies only `dist/` from the build stage and reinstalls production-only dependencies. The final image contains no dev tooling or source files.
+
+```dockerfile
+CMD ["node", "./dist/server/entry.mjs"]
+```
+
+### Build command
+
+```bash
+docker build \
+  --build-arg PUBLIC_UMAMI_SCRIPT_URL=https://umami.example.com/script.js \
+  --build-arg PUBLIC_UMAMI_WEBSITE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  -t mundial-de-clicks .
+```
+
+Omit the `--build-arg` flags entirely if you don't need Umami analytics.
+
+### Run command
+
+```bash
+docker run -p 4321:4321 \
+  -e REDIS_URL=redis://host.docker.internal:6379 \
+  -e HOST=0.0.0.0 \
+  -e PORT=4321 \
+  mundial-de-clicks
+```
+
+`host.docker.internal` resolves to the host machine from inside a Docker container on macOS and Windows. On Linux, use `--add-host=host.docker.internal:host-gateway` or replace it with your DragonFly container's IP / service name.
+
+## Dockerfile overview
+
+```dockerfile
+# ---- Build ----------------------------------------------------------
+FROM node:22-alpine AS build
+WORKDIR /app
+
+# pnpm via corepack (honours the version pinned in the project).
+RUN corepack enable
+
+# Install dependencies (cacheable layer).
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+
+# Umami analytics vars are PUBLIC_* → Vite bakes them at build time.
+ARG PUBLIC_UMAMI_SCRIPT_URL=""
+ARG PUBLIC_UMAMI_WEBSITE_ID=""
+ENV PUBLIC_UMAMI_SCRIPT_URL=$PUBLIC_UMAMI_SCRIPT_URL
+ENV PUBLIC_UMAMI_WEBSITE_ID=$PUBLIC_UMAMI_WEBSITE_ID
+
+# Build the app.
+COPY . .
+RUN pnpm build
+
+# ---- Runtime --------------------------------------------------------
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+
+RUN corepack enable
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile --prod
+
+COPY --from=build /app/dist ./dist
+
+ENV HOST=0.0.0.0
+ENV PORT=4321
+EXPOSE 4321
+
+CMD ["node", "./dist/server/entry.mjs"]
+```
+
+## DragonFly persistence in Docker
+
+DragonFly uses RDB-style snapshots rather than AOF. The `docker-compose.yml` starts it with:
+
+```yaml
+command: >
+  dragonfly
+  --dir /data
+  --dbfilename snapshot
+  --snapshot_cron "*/5 * * * *"
+```
+
+`--snapshot_cron "*/5 * * * *"` triggers a snapshot to `/data/snapshot` every 5 minutes. On an unexpected restart, at most 5 minutes of vote data is lost — an acceptable trade-off for a click counter. The `dragonfly-data` named volume persists the snapshot file across container restarts and upgrades.
+
+<Note>
+  The `ulimits: memlock: -1` setting in the Compose file is required for
+  DragonFly to lock its working set in physical memory. Without it, DragonFly
+  may log warnings or refuse to start on some Linux kernel configurations.
+</Note>
+
+## Environment variables in Compose
+
+Copy `.env.example` to `.env` and uncomment the values you want to override. All variables have sensible defaults for local development.
+
+The following variables are **only meaningful inside docker-compose** and are not read by the Astro app:
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `POSTGRES_DB` | `umami` | Postgres database name for Umami |
+| `POSTGRES_USER` | `umami` | Postgres user for Umami |
+| `POSTGRES_PASSWORD` | `umami_password` | Postgres password for Umami |
+| `UMAMI_APP_SECRET` | `cambia_este_secreto` | Umami session signing secret |
+
+<Warning>
+  Change `POSTGRES_PASSWORD` and `UMAMI_APP_SECRET` before exposing Umami to
+  the public internet. The defaults are placeholder values only.
+</Warning>
+
+For all other variables (DragonFly connection, rate limiting, captcha, SSE tuning), see the [Coolify deployment guide](/deployment/coolify) which contains the full reference table.

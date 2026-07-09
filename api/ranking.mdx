@@ -1,0 +1,126 @@
+---
+title: "GET /api/ranking — Fetch Current World Ranking Snapshot"
+sidebarTitle: "GET /api/ranking"
+description: "GET /api/ranking returns the current WorldSnapshot from in-memory state, including the full ranking, total votes, clicks per minute, and recent live events."
+---
+
+`GET /api/ranking` returns the current state of the mundial — a complete `WorldSnapshot` containing the full country ranking, global vote totals, clicks-per-minute rate, and recent live events such as overtakes and milestones. Because data is served directly from the in-memory `WorldState` singleton, the endpoint is extremely cheap: no database query is required unless the in-memory cache is stale.
+
+## When to Use This vs. SSE
+
+<Info>
+  For most clients, `GET /api/ranking` and `GET /api/stream` are complementary, not interchangeable.
+</Info>
+
+- **Use `GET /api/ranking`** for the initial page load. The Astro SSR layer reads the snapshot at render time and embeds it into the page, so the user sees a populated ranking before any JavaScript runs. It is also the correct fallback for environments where `EventSource` is unavailable or blocked.
+- **Use `GET /api/stream`** (SSE) for live updates after the page loads — it pushes a new snapshot every second when data changes, with no polling required on the client side.
+
+## Request
+
+**Method:** `GET`  
+**Authentication:** None required  
+**Parameters:** None
+
+The response always includes `cache-control: no-store` to prevent intermediate proxies and CDNs from serving stale rankings.
+
+## Response
+
+### 200 — Success
+
+```json
+{
+  "ranking": [
+    { "code": "es", "name": "España", "votes": 15420, "position": 1 },
+    { "code": "ar", "name": "Argentina", "votes": 14891, "position": 2 },
+    { "code": "br", "name": "Brasil", "votes": 12033, "position": 3 }
+  ],
+  "totalVotes": 87234,
+  "clicksPerMinute": 1420,
+  "blockedClicks": 342,
+  "events": [
+    {
+      "id": "1719000000000-1",
+      "type": "leader",
+      "message": "España se pone LÍDER",
+      "code": "es",
+      "at": 1719000000000
+    }
+  ]
+}
+```
+
+<ResponseField name="ranking" type="RankingEntry[]">
+  Ordered array of all participating countries, sorted descending by vote count. Position 1 is the current leader.
+
+  <Expandable title="RankingEntry fields">
+    <ResponseField name="code" type="string">
+      ISO 3166-1 alpha-2 lowercase country code (e.g. `"es"`). Matches the keys accepted by `POST /api/vote` and the flag sprite ID `#flag-{code}`.
+    </ResponseField>
+
+    <ResponseField name="name" type="string">
+      Human-readable country name in Spanish (e.g. `"España"`).
+    </ResponseField>
+
+    <ResponseField name="votes" type="number">
+      Cumulative accepted vote count for this country since the mundial started. This number only ever increases.
+    </ResponseField>
+
+    <ResponseField name="position" type="number">
+      Current ranking position, starting at 1 for the leader. Positions are recalculated each time the `WorldState` is refreshed from DragonFly.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="totalVotes" type="number">
+  Global sum of all accepted votes across all 16 countries.
+</ResponseField>
+
+<ResponseField name="clicksPerMinute" type="number">
+  Sliding 60-second window click rate, calculated server-side. Reflects the current voting intensity across all clients.
+</ResponseField>
+
+<ResponseField name="blockedClicks" type="number">
+  Cumulative count of votes blocked by the rate limiter since server start. Useful for monitoring abuse levels.
+</ResponseField>
+
+<ResponseField name="events" type="LiveEvent[]">
+  Recent live events broadcast to all clients — overtakes, round-number milestones, and leadership changes. The array is ordered chronologically.
+
+  <Expandable title="LiveEvent fields">
+    <ResponseField name="id" type="string">
+      Unique event identifier in the format `"{epochMs}-{sequence}"` (e.g. `"1719000000000-1"`).
+    </ResponseField>
+
+    <ResponseField name="type" type="string">
+      Event classification. One of:
+      - `"overtake"` — one country surpassed another in the ranking
+      - `"milestone"` — a country crossed a round-number vote threshold
+      - `"leader"` — a country took or extended the lead
+    </ResponseField>
+
+    <ResponseField name="message" type="string">
+      Human-readable description of the event, in Spanish (e.g. `"España se pone LÍDER"`).
+    </ResponseField>
+
+    <ResponseField name="code" type="string">
+      Country code of the event's protagonist. Present for `"overtake"`, `"milestone"`, and `"leader"` events; may be omitted for global events.
+    </ResponseField>
+
+    <ResponseField name="at" type="number">
+      Unix timestamp in milliseconds when the event was detected.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Freshness and Staleness
+
+The endpoint calls `world.refreshIfStale(RANKING_MIN_REFRESH_MS)` before serializing the snapshot. If the last DragonFly read happened more than `RANKING_MIN_REFRESH_MS` milliseconds ago (default **750 ms**, configurable via the `RANKING_MIN_REFRESH_MS` environment variable), a fresh pipeline read is triggered before the response is sent.
+
+This matters in two scenarios:
+
+1. **No active SSE subscribers** — when no clients are connected to `GET /api/stream`, the background poller is idle and the in-memory state may be minutes old. The staleness check guarantees that the first visitor (or a polling fallback client) always receives a current snapshot.
+2. **SSR on page load** — Astro renders the initial HTML server-side. The staleness check ensures the embedded snapshot reflects the real current ranking rather than whatever was in memory from a previous request cycle.
+
+<Note>
+  `refreshIfStale` is guarded internally: if a refresh is already in progress, concurrent callers wait for the same result rather than firing multiple DragonFly pipelines simultaneously.
+</Note>

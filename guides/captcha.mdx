@@ -1,0 +1,211 @@
+---
+title: "Cap Proof-of-Work Captcha Integration Guide"
+sidebarTitle: "Captcha"
+description: "Set up Cap standalone PoW captcha for Mundial de Clicks. Learn the challenge-redeem flow, session management, and how to deploy Cap as a separate service."
+---
+
+Mundial de Clicks uses [Cap](https://capjs.js.org) — a proof-of-work captcha — to make bot automation CPU-expensive. Unlike image or click-based captchas, Cap asks the browser to solve a short computational puzzle before votes are accepted. There is no third-party tracking, no image labelling, and no iframes: the widget runs entirely in a WebWorker with a small WASM binary.
+
+## How it works
+
+The app acts as a **proxy** between the browser and the Cap standalone server. The browser never talks directly to Cap — all challenge and redeem traffic goes through `/api/captcha/*` on the same origin, so there are no CORS issues and no mixed-content warnings.
+
+<Steps>
+  <Step title="Page load: check session validity">
+    The browser calls `GET /api/captcha/session`. The server reads the `cap_session` cookie, checks both the quota key (`cap:sess:{id}`) and the IP-binding key (`cap:sess-ip:{id}`) in DragonFly, and returns:
+    ```json
+    { "required": true, "valid": false }
+    ```
+    If `valid` is `true`, the client proceeds to vote immediately.
+  </Step>
+
+  <Step title="Request a challenge">
+    If the session is not valid, the Cap widget calls `POST /api/captcha/challenge`. The server:
+    1. Checks the per-IP abuse limit (`CAP_CHALLENGE_MAX_PER_MINUTE`, default 6/min).
+    2. Reads the IP's daily vote count from DragonFly to calculate the current difficulty.
+    3. Proxies a `POST` to `{CAP_API_URL}/challenge` with `{ challengeDifficulty: N }`.
+    4. Returns Cap's challenge payload directly to the widget.
+  </Step>
+
+  <Step title="Client solves the puzzle">
+    The Cap widget solves the PoW puzzle in a WebWorker using WASM. This is the CPU-bound step that makes automation expensive. The browser does not need to do anything else during this time.
+  </Step>
+
+  <Step title="Redeem the solution">
+    The widget calls `POST /api/captcha/redeem` with the solution token. The server:
+    1. Checks the per-IP abuse limit (`CAP_REDEEM_MAX_PER_MINUTE`, default 12/min).
+    2. Proxies the solution to `{CAP_API_URL}/redeem`.
+    3. If Cap returns `{ success: true }`, creates a session in DragonFly and sets two `Set-Cookie` headers: `cap_session` (the vote session) and `voter_id` (the persistent voter identity).
+  </Step>
+
+  <Step title="Vote with the session cookie">
+    Subsequent `POST /api/vote` requests include the `cap_session` cookie automatically. The atomic Lua script in DragonFly verifies the session, checks the IP binding, and decrements the quota — all in one round-trip.
+  </Step>
+
+  <Step title="Quota exhausted or session expired">
+    When the vote quota reaches 0, the session keys are deleted. When the TTL expires without further votes, DragonFly evicts the keys automatically. Either way, the next vote attempt returns `captcha_required` and the browser triggers a new challenge.
+  </Step>
+</Steps>
+
+---
+
+## Session mechanics
+
+A verified captcha session is stored as two DragonFly keys:
+
+| Key | Value | Purpose |
+|---|---|---|
+| `cap:sess:{uuid}` | Integer (remaining vote quota) | Tracks how many votes remain |
+| `cap:sess-ip:{uuid}` | IP string | Binds the session to its origin IP |
+
+**IP binding** is enforced atomically inside the Lua vote script. If the IP stored at `cap:sess-ip:{id}` does not match the IP of the current request, the script returns `-1` immediately and no votes are recorded. A stolen or shared cookie from a different IP is therefore useless.
+
+**TTL and renewal:**
+
+The session TTL is set by `CAP_SESSION_TTL_SECONDS` (default `120` s). Every time a vote is accepted, both keys have their TTL reset to this value via `EXPIRE`. A user who votes continuously will never see the captcha dialog again. A session that goes idle for more than the TTL expires naturally.
+
+**Vote quota:**
+
+The quota is the lesser of `CAP_VOTES_PER_SESSION` and `CAP_SESSION_HARD_VOTE_CAP` (both default `50`):
+
+```ts
+SESSION_VOTE_QUOTA = Math.max(1, Math.min(votesPerSession, hardVotesPerSession));
+```
+
+The hard cap exists so that setting `CAP_VOTES_PER_SESSION` to a very large number does not accidentally grant unlimited votes from a single solved captcha.
+
+When quota reaches `0` after a vote batch, both keys are deleted with `DEL` inside the same Lua transaction.
+
+---
+
+## Progressive difficulty
+
+Each challenge request reads the IP's current daily vote count (the higher of the IP counter and the `voter_id` counter) and calculates difficulty:
+
+```ts
+function challengeDifficulty(dailyVotes: number): number {
+  const base = Math.max(1, config.captcha.challengeDifficultyBase);   // default 4
+  const max  = Math.max(base, config.captcha.challengeDifficultyMax); // default 8
+  const step = Math.max(1, config.captcha.challengeDifficultyStepVotes); // default 250
+  return Math.min(max, base + Math.floor(dailyVotes / step));
+}
+```
+
+With the default values:
+
+| Daily votes cast | Difficulty |
+|---|---|
+| 0 – 249 | 4 (base) |
+| 250 – 499 | 5 |
+| 500 – 749 | 6 |
+| 750 – 999 | 7 |
+| 1 000 + | 8 (max) |
+
+The difficulty is set server-side and forwarded to Cap — the client cannot request a lower difficulty.
+
+---
+
+## Deploying Cap standalone
+
+Cap requires its own server process. The app does **not** bundle a Cap server — it only proxies to one.
+
+<Steps>
+  <Step title="Deploy Cap in Coolify">
+    In Coolify, click **+ New → Service** and search for the Cap standalone template. Coolify will create the service and assign it an internal hostname (e.g. `cap`).
+  </Step>
+
+  <Step title="Get your site key">
+    After Cap starts, open its dashboard and create a site. Copy the **site key** (a short alphanumeric string).
+  </Step>
+
+  <Step title="Configure the app">
+    Add the following environment variable to the Mundial de Clicks service in Coolify, replacing the hostname and site key:
+    ```bash
+    CAP_API_URL=https://cap.example.com/your-site-key
+    ```
+    The app will strip trailing slashes and proxy to `{CAP_API_URL}/challenge` and `{CAP_API_URL}/redeem`.
+  </Step>
+
+  <Step title="Redeploy the app">
+    `CAP_API_URL` is a runtime variable — a restart (not a full rebuild) is sufficient.
+  </Step>
+</Steps>
+
+<Note>
+  The app has a hard timeout on server-to-server calls to Cap (`CAP_HTTP_TIMEOUT_MS`, default `5000` ms). If Cap is unreachable or slow, the challenge and redeem endpoints return `502` rather than leaving the client connection hanging.
+</Note>
+
+---
+
+## Client-side integration
+
+If you are building a custom frontend rather than using the default Astro pages:
+
+<CardGroup cols={2}>
+  <Card title="Install the widget" icon="package">
+    ```bash
+    npm install @cap.js/widget
+    ```
+    Import and mount the `<cap-widget>` custom element. It handles WebWorker creation, WASM loading, and the challenge/redeem calls automatically.
+  </Card>
+  <Card title="Session cookie" icon="cookie">
+    On a successful redeem, the server sets `cap_session` as `HttpOnly; SameSite=Lax`. The browser attaches it to every subsequent same-origin `POST /api/vote` request automatically — no manual header required.
+  </Card>
+</CardGroup>
+
+**Checking session state:**
+
+```ts
+const res = await fetch('/api/captcha/session');
+const { required, valid } = await res.json();
+
+if (required && !valid) {
+  // Show captcha widget
+}
+```
+
+**Captcha exponential backoff:**
+
+If `POST /api/vote` returns `captcha_required` multiple times (e.g. the session expired mid-batch), the client applies exponential backoff before re-triggering the widget:
+
+```ts
+const delayMs = Math.min(400 * 2 ** failureCount, 20_000);
+```
+
+Votes are **not discarded** during this wait — they stay in the pending batch and are re-sent once the new session is established.
+
+---
+
+## Disabling captcha
+
+Leave `CAP_API_URL` unset (empty string or absent from the environment). The `hasCaptcha` flag in `features.ts` evaluates to `false`, and the Lua vote script skips session validation entirely.
+
+<Warning>
+  In production (`NODE_ENV=production`), if `hasCaptcha` is `false`, every `POST /api/vote` request returns `503 captcha_required`. Captcha is **mandatory** for production deployments. Running without captcha is supported only in local development and demo mode.
+</Warning>
+
+---
+
+## Captcha environment variables
+
+```bash
+# URL of your Cap standalone server, including the site key
+CAP_API_URL=https://cap.example.com/your-site-key
+
+# Session behaviour
+CAP_VOTES_PER_SESSION=50          # votes allowed per solved captcha
+CAP_SESSION_HARD_VOTE_CAP=50      # hard upper bound (overrides the above if lower)
+CAP_SESSION_TTL_SECONDS=120       # idle timeout in seconds
+
+# Abuse limits on captcha endpoints
+CAP_CHALLENGE_MAX_PER_MINUTE=6
+CAP_REDEEM_MAX_PER_MINUTE=12
+
+# Progressive difficulty
+CAP_CHALLENGE_DIFFICULTY_BASE=4
+CAP_CHALLENGE_DIFFICULTY_MAX=8
+CAP_CHALLENGE_DIFFICULTY_STEP_VOTES=250
+
+# Server-to-server HTTP timeout
+CAP_HTTP_TIMEOUT_MS=5000
+```

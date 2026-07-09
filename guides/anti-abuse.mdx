@@ -1,0 +1,175 @@
+---
+title: "Rate Limiting, Daily Caps, and Bot Defense in Depth"
+sidebarTitle: "Anti-Abuse"
+description: "How Mundial de Clicks stacks three layers of abuse protection: per-IP rate limiting, daily vote caps per IP and voter_id, and Cap proof-of-work captcha."
+---
+
+Mundial de Clicks stacks three independent layers of protection so that bots and abusers never get a free ride. Each layer targets a different attack pattern: the token-bucket rate limiter cuts off burst flooding within seconds, daily vote caps prevent sustained automation from accumulating meaningful scores, and Cap proof-of-work captcha makes spinning up new identities CPU-expensive. Removing any one layer still leaves two others in place.
+
+## Layer 1: Per-IP rate limiting (token bucket)
+
+The rate limiter runs inside the atomic Lua script in `votes.ts`, which means the check and the write happen in a single DragonFly round-trip with no race conditions.
+
+<Info>
+  The rate limit is **not** the primary bot defense — that role belongs to the captcha. Its job is to cap the burst rate so a single IP cannot flood the server faster than a human could physically click.
+</Info>
+
+**How it works:**
+
+- Each IP gets a virtual token bucket keyed as `rl:{ip}` (a `HASH` with `tokens` and `updated` fields).
+- Tokens refill linearly over the configured window. At any moment:
+  ```
+  tokens = stored_tokens + (elapsed_ms × maxBucket / windowMs)
+  tokens = min(tokens, maxBucket)
+  ```
+- A batch of votes costs `count` tokens. If fewer tokens are available than requested, only the available portion is accepted; the rest is immediately **blocked** (not queued).
+- Blocked clicks are incremented on the `votes:blocked` key and surfaced as `WorldSnapshot.blockedClicks` in the SSE stream.
+
+**Default values** (from `.env.example`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RATE_LIMIT_MAX` | `5` | Tokens per window (maximum burst per IP) |
+| `RATE_LIMIT_WINDOW` | `1` | Window duration in seconds |
+
+So by default each IP may cast up to **5 votes per second** before further clicks are blocked.
+
+**When rate-limited**, `POST /api/vote` responds:
+
+```json
+{ "ok": false, "reason": "rate_limited", "retryAfter": 200 }
+```
+
+`retryAfter` is the number of milliseconds until at least one token will be available again:
+
+```lua
+retryAfter = ceil((1 - tokens) * refillWindowMs / maxBucket)
+```
+
+**Tuning tip:** Raise `RATE_LIMIT_MAX` to let enthusiastic human clickers through without being throttled. Because captcha is the real bot gate, a generous rate limit is fine for legitimate users.
+
+---
+
+## Layer 2: Daily vote caps
+
+Even if a bot obtains valid captcha sessions continuously, daily vote caps ensure it cannot accumulate an unlimited number of ranked votes in a single day.
+
+**How it works:**
+
+Two separate counters are maintained per UTC day:
+
+| Key pattern | Tracks |
+|---|---|
+| `daily:ip:{ip}:{YYYY-MM-DD}` | Votes cast from this IP today |
+| `daily:voter:{id}:{YYYY-MM-DD}` | Votes cast by this `voter_id` today |
+
+The Lua script takes the **maximum** of the two counts (not the sum) and compares it against `DAILY_VOTE_MAX_PER_IP`. Once the cap is hit, votes are silently not counted toward the ranking — the user still sees the UI respond, but the score does not increase.
+
+Using the higher of the two counters makes the dual-key approach meaningful: an attacker who rotates IPs but keeps the same browser cookie, or rotates cookies but stays on one IP, still gets caught.
+
+**voter_id cookie:**
+
+The `voter_id` cookie is a HMAC-SHA256 signed UUID (signed with `VOTER_ID_SECRET`). It is `HttpOnly`, `SameSite=Lax`, and lasts 180 days. Because it is tamper-evident, fabricating a valid cookie requires knowing the signing secret.
+
+**Key expiry:**
+
+Both daily counters expire at the next UTC midnight, calculated as:
+
+```ts
+const next = Date.UTC(year, month, day + 1);
+const ttl = Math.ceil((next - now) / 1000); // seconds
+```
+
+The TTL is applied with `EXPIRE` inside the same atomic Lua script that increments the counter.
+
+**Default:**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DAILY_VOTE_MAX_PER_IP` | `2000` | Max votes counted per IP/voter per UTC day |
+
+---
+
+## Layer 3: Cap PoW captcha
+
+Before any votes are accepted, the client must hold a valid Cap session cookie. The captcha is proof-of-work: the client's CPU must solve a computational puzzle to obtain the session. This makes creating new "identities" expensive and does not rely on image recognition or third-party user tracking.
+
+See the [Captcha Integration Guide](/guides/captcha) for the full setup, session mechanics, and difficulty configuration.
+
+<Tip>
+  Progressive difficulty means heavy daily voters face harder puzzles automatically — no manual tuning required. Difficulty increases by 1 for every `CAP_CHALLENGE_DIFFICULTY_STEP_VOTES` votes cast that UTC day.
+</Tip>
+
+---
+
+## Abuse limits on captcha endpoints
+
+The captcha endpoints themselves are rate-limited by `consumeAbuseLimit`, a lightweight per-IP/per-minute counter backed by DragonFly (or an in-memory fallback in demo mode). This prevents attackers from brute-forcing the captcha flow at high volume.
+
+| Endpoint | Variable | Default | Window |
+|---|---|---|---|
+| `POST /api/captcha/challenge` | `CAP_CHALLENGE_MAX_PER_MINUTE` | `6` | 60 s |
+| `POST /api/captcha/redeem` | `CAP_REDEEM_MAX_PER_MINUTE` | `12` | 60 s |
+
+The abuse-limit key is `ab:captcha:{challenge|redeem}:{ip}:{window}`, where `window` is the current 60-second epoch bucket. It expires one second after the window ends.
+
+When the limit is exceeded, the endpoint returns:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 43
+Content-Type: application/json
+
+{ "error": "rate_limited" }
+```
+
+---
+
+## Defense against memory DoS
+
+`POST /api/vote` reads the request body with a hard byte cap of **2 048 bytes** (`MAX_BODY_BYTES`). The stream is consumed byte-by-byte; if the accumulated size exceeds the limit the request is rejected immediately, regardless of what the `Content-Length` header claims. This prevents an attacker from streaming a large body to exhaust server memory.
+
+---
+
+## Tuning reference
+
+Adjust these environment variables to shift the balance between user experience and abuse resistance. All values are read at server startup — a restart is required for changes to take effect.
+
+| Goal | Variable(s) to adjust |
+|---|---|
+| Allow faster human clicking | Increase `RATE_LIMIT_MAX` |
+| Limit sustained automated voting | Decrease `DAILY_VOTE_MAX_PER_IP` |
+| Make captcha puzzles harder | Increase `CAP_CHALLENGE_DIFFICULTY_BASE` |
+| Require more frequent captcha solving | Decrease `CAP_VOTES_PER_SESSION` |
+| Limit SSE connection abuse | Decrease `MAX_SSE_CONNECTIONS_PER_IP` |
+
+<Accordion title="Full list of anti-abuse environment variables">
+
+```bash
+# Rate limiting
+RATE_LIMIT_MAX=5
+RATE_LIMIT_WINDOW=1
+
+# Daily vote cap
+DAILY_VOTE_MAX_PER_IP=2000
+
+# Captcha session
+CAP_VOTES_PER_SESSION=50
+CAP_SESSION_HARD_VOTE_CAP=50
+CAP_SESSION_TTL_SECONDS=120
+
+# Captcha endpoint abuse limits
+CAP_CHALLENGE_MAX_PER_MINUTE=6
+CAP_REDEEM_MAX_PER_MINUTE=12
+
+# Captcha difficulty progression
+CAP_CHALLENGE_DIFFICULTY_BASE=4
+CAP_CHALLENGE_DIFFICULTY_MAX=8
+CAP_CHALLENGE_DIFFICULTY_STEP_VOTES=250
+
+# SSE connection limits
+MAX_SSE_CONNECTIONS=20000
+MAX_SSE_CONNECTIONS_PER_IP=4
+```
+
+</Accordion>

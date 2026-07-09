@@ -1,20 +1,78 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Mundial de Clicks: Real-Time Click-Voting for the World Cup"
+sidebarTitle: "Home"
+description: "Mundial de Clicks is a high-throughput real-time voting app built with Astro SSR, DragonFly, and SSE. Deploy it, configure it, and handle millions of clicks."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Mundial de Clicks is an open-source real-time web app where users click to vote for their national team. Every click is a vote, the global ranking updates live via Server-Sent Events, and the infrastructure is built to survive internet-scale traffic spikes — atomic DragonFly counters, a single Lua script per vote batch, and one global polling loop that scales to thousands of simultaneous viewers.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run the app locally in three commands — no configuration required.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how votes flow from click to DragonFly to every viewer's screen.
+  </Card>
+  <Card title="Deploy on Coolify" icon="cloud" href="/deployment/coolify">
+    Step-by-step guide to deploying the full stack on a VPS with Coolify.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/vote">
+    Explore every endpoint: vote, ranking, SSE stream, captcha, health, and status.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## How it works
+
+Mundial de Clicks is engineered to absorb massive click bursts without falling over. The core trick is that **no row is written per click**:
+
+<Steps>
+  <Step title="User clicks a flag">
+    The browser accumulates clicks for 400 ms and sends them as a single batched request — up to 10 votes across 3 countries at once. The UI updates instantly (optimistic state).
+  </Step>
+  <Step title="Atomic Lua script runs in DragonFly">
+    A single Lua script validates the captcha session, applies rate limiting, writes `ZINCRBY` on the ranking sorted set, and increments the per-second CPM bucket — all in one round-trip, zero race conditions.
+  </Step>
+  <Step title="One poller serializes the world">
+    A single `setInterval` loop reads DragonFly once per tick, detects overtakes and milestones, serializes the snapshot to bytes **once**, and fans it out to every connected SSE subscriber. 1 viewer or 50,000 — same cost.
+  </Step>
+  <Step title="SSE delivers real-time updates">
+    Every browser subscribed to `GET /api/stream` receives the updated `WorldSnapshot` as a Server-Sent Event and re-renders the ranking without polling.
+  </Step>
+</Steps>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Atomic vote processing" icon="bolt">
+    One Lua script handles rate limiting, session validation, and vote writing in a single DragonFly round-trip.
+  </Card>
+  <Card title="Global SSE broadcast" icon="satellite-dish">
+    One serialization per tick, shared across all viewers. Viewer count doesn't affect DragonFly load.
+  </Card>
+  <Card title="Cap PoW captcha" icon="shield-halved">
+    Proof-of-work anti-bot protection with progressive difficulty that scales with daily vote count per IP.
+  </Card>
+  <Card title="In-memory fallback" icon="database">
+    Works without DragonFly configured — votes run in-process memory so you can develop locally instantly.
+  </Card>
+  <Card title="Daily vote limits" icon="calendar">
+    Per-IP and per-signed-cookie daily caps enforced atomically inside the same Lua script.
+  </Card>
+  <Card title="Coolify deployment" icon="server">
+    Three services (app + DragonFly + Umami) wired together with environment variables — no code changes needed.
+  </Card>
+</CardGroup>
+
+## Explore the documentation
+
+<CardGroup cols={3}>
+  <Card title="Environment Variables" icon="gear" href="/configuration/environment-variables">
+    Every configuration knob with defaults and production recommendations.
+  </Card>
+  <Card title="Anti-Abuse Guide" icon="shield" href="/guides/anti-abuse">
+    How rate limiting, daily caps, and captcha work together to stop bots.
+  </Card>
+  <Card title="Analytics Setup" icon="chart-bar" href="/guides/analytics">
+    Add Umami analytics to track real-time user engagement.
+  </Card>
+</CardGroup>
