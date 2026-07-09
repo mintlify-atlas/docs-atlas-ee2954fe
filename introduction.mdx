@@ -1,7 +1,7 @@
 ---
 title: "Mundial de Clicks: Real-Time Voting at Internet Scale"
 sidebarTitle: "Introduction"
-description: "Mundial de Clicks is an open-source real-time click-voting app for the World Cup. Built with Astro SSR, DragonFly, SSE, and a single Lua script for atomic vote processing."
+description: "Mundial de Clicks is a real-time click-voting app built with Astro SSR and DragonFly. One Lua script, one poller, zero per-viewer cost."
 ---
 
 Mundial de Clicks is a real-time web app where users click to vote for their national football team and watch a live global ranking update instantly across every connected browser. What makes it interesting from an engineering standpoint is not the UI — it's the infrastructure decisions that let a single Node.js process absorb a wave of internet traffic without falling over: atomic counters instead of row-per-vote writes, a single shared polling loop that costs the same whether one person or fifty thousand are watching, and a Lua script that collapses rate-limiting, daily caps, and vote writes into one network round-trip.
@@ -51,7 +51,7 @@ The two decisions that define the architecture are:
 
 | Layer | Technology |
 |---|---|
-| Framework | Astro 5 — `output: 'server'` with `@astrojs/node` standalone adapter |
+| Framework | Astro 7 — `output: 'server'` with `@astrojs/node` standalone adapter |
 | Database | DragonFly — Redis-protocol in-memory store with 5-minute snapshot persistence |
 | Language | TypeScript (strict), with Lua scripts embedded for atomic DragonFly operations |
 | Styling | Tailwind CSS v4 via `@tailwindcss/vite` + Geist Pixel font |

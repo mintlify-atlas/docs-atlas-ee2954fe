@@ -1,5 +1,5 @@
 ---
-title: "Cap Proof-of-Work Captcha Integration Guide"
+title: "Cap Proof-of-Work Captcha: Integration and Session Guide"
 sidebarTitle: "Captcha"
 description: "Set up Cap standalone PoW captcha for Mundial de Clicks. Learn the challenge-redeem flow, session management, and how to deploy Cap as a separate service."
 ---
@@ -62,7 +62,7 @@ A verified captcha session is stored as two DragonFly keys:
 
 **TTL and renewal:**
 
-The session TTL is set by `CAP_SESSION_TTL_SECONDS` (default `120` s). Every time a vote is accepted, both keys have their TTL reset to this value via `EXPIRE`. A user who votes continuously will never see the captcha dialog again. A session that goes idle for more than the TTL expires naturally.
+The effective session TTL is `Math.max(30, CAP_SESSION_TTL_SECONDS)` — the value is floored at 30 seconds so that a misconfigured or very small `CAP_SESSION_TTL_SECONDS` cannot create a session that expires almost immediately. With the default of `120` s the floor has no effect. Every time a vote is accepted, both keys have their TTL reset to this value via `EXPIRE`. A user who votes continuously will never see the captcha dialog again. A session that goes idle for longer than the TTL expires naturally.
 
 **Vote quota:**
 
@@ -176,9 +176,26 @@ Votes are **not discarded** during this wait — they stay in the pending batch 
 
 ---
 
+## Client-side gamified challenges
+
+Separate from the Cap PoW captcha, the client (`scripts/main.ts` + `scripts/challenge.ts`) presents occasional **in-UI game challenges** to add friction without interrupting the invisible PoW flow. These are purely client-side and do not involve the server.
+
+Every **60 to 110 accepted votes** (chosen at random each time) a full-screen overlay appears and the user must complete one of two mini-games before voting can continue:
+
+| Challenge | Description |
+|---|---|
+| ⚽ **Penalty kick** | Choose left, centre, or right. The goalkeeper dives to a random zone — score to continue. Appears with 2× frequency. |
+| 🚩 **Guess the flag** | Pick the correct country flag from three options. |
+
+The interval is randomised (`CHALLENGE_MIN = 60`, `CHALLENGE_MAX = 110`) so it is less predictable than a fixed threshold. Pending votes are flushed before the overlay appears and resume automatically once the user solves the challenge.
+
+These challenges are independent of `hasCaptcha` — they run even when the Cap PoW captcha is disabled.
+
+---
+
 ## Disabling captcha
 
-Leave `CAP_API_URL` unset (empty string or absent from the environment). The `hasCaptcha` flag in `features.ts` evaluates to `false`, and the Lua vote script skips session validation entirely.
+`hasCaptcha` in `features.ts` is `true` only when **both** `CAP_API_URL` is set **and** DragonFly is configured (`REDIS_URL` or `DRAGONFLY_HOST`). Sessions are stored in DragonFly, so captcha cannot function without it. Leave `CAP_API_URL` unset (or leave DragonFly unconfigured) and `hasCaptcha` evaluates to `false` — the Lua vote script skips session validation entirely.
 
 <Warning>
   In production (`NODE_ENV=production`), if `hasCaptcha` is `false`, every `POST /api/vote` request returns `503 captcha_required`. Captcha is **mandatory** for production deployments. Running without captcha is supported only in local development and demo mode.

@@ -1,7 +1,7 @@
 ---
 title: "GET /api/ranking — Fetch Current World Ranking Snapshot"
 sidebarTitle: "GET /api/ranking"
-description: "GET /api/ranking returns the current WorldSnapshot from in-memory state, including the full ranking, total votes, clicks per minute, and recent live events."
+description: "GET /api/ranking returns the current WorldSnapshot from in-memory state, including the full ranking, total votes, clicks per minute, and live events."
 ---
 
 `GET /api/ranking` returns the current state of the mundial — a complete `WorldSnapshot` containing the full country ranking, global vote totals, clicks-per-minute rate, and recent live events such as overtakes and milestones. Because data is served directly from the in-memory `WorldState` singleton, the endpoint is extremely cheap: no database query is required unless the in-memory cache is stale.
@@ -84,7 +84,7 @@ The response always includes `cache-control: no-store` to prevent intermediate p
 </ResponseField>
 
 <ResponseField name="events" type="LiveEvent[]">
-  Recent live events broadcast to all clients — overtakes, round-number milestones, and leadership changes. The array is ordered chronologically.
+  Recent live events broadcast to all clients — overtakes, round-number milestones, and leadership changes. The array is ordered newest-first (index 0 is the most recent event).
 
   <Expandable title="LiveEvent fields">
     <ResponseField name="id" type="string">
@@ -94,7 +94,7 @@ The response always includes `cache-control: no-store` to prevent intermediate p
     <ResponseField name="type" type="string">
       Event classification. One of:
       - `"overtake"` — one country surpassed another in the ranking
-      - `"milestone"` — a country crossed a round-number vote threshold
+      - `"milestone"` — the global total votes crossed a round-number threshold (1 k, 10 k, 50 k, 100 k, 500 k, 1 M)
       - `"leader"` — a country took or extended the lead
     </ResponseField>
 
@@ -103,7 +103,7 @@ The response always includes `cache-control: no-store` to prevent intermediate p
     </ResponseField>
 
     <ResponseField name="code" type="string">
-      Country code of the event's protagonist. Present for `"overtake"`, `"milestone"`, and `"leader"` events; may be omitted for global events.
+      Country code of the event's protagonist. Present for `"overtake"` and `"leader"` events. Omitted for `"milestone"` events, which track the global total rather than a single country.
     </ResponseField>
 
     <ResponseField name="at" type="number">

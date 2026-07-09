@@ -1,7 +1,7 @@
 ---
-title: "GET /api/health — Node Server Health Check"
+title: "GET /api/health — Node.js Process Liveness Probe"
 sidebarTitle: "GET /health"
-description: "GET /api/health returns 200 OK when the Node.js server is running. Does not check DragonFly or other dependencies — used by Coolify and Traefik as a liveness probe."
+description: "GET /api/health returns plain-text 200 OK confirming the Node.js process is alive. No external dependencies checked. Polled by Coolify and Traefik."
 ---
 
 `GET /api/health` is a lightweight liveness probe. It returns `200 OK` with a plain-text body of `OK` immediately, without touching DragonFly, the Cap server, or any other external dependency. Coolify and Traefik poll this endpoint to decide whether the container is alive and eligible to receive traffic. Because the implementation contains no I/O whatsoever, response time is effectively zero and the endpoint cannot fail due to infrastructure issues unrelated to the Node.js process itself.
@@ -18,7 +18,7 @@ No parameters, no authentication, no cookies required.
 
 **Status**: `200 OK`
 
-```
+```text
 OK
 ```
 

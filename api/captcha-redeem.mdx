@@ -56,7 +56,7 @@ Two cookies are set in the response:
   - `cap:sess:{id}` — remaining vote quota, initialised to `min(CAP_VOTES_PER_SESSION, CAP_SESSION_HARD_VOTE_CAP)` (default `50`).
   - `cap:sess-ip:{id}` — the trusted client IP bound at creation time.
 
-  Cookie attributes: `Path=/; HttpOnly; SameSite=Lax; Max-Age={CAP_SESSION_TTL_SECONDS}` (default 120 s). Each accepted vote decrements the quota and renews the TTL. The session expires by time or by exhausting the quota, whichever comes first. The `Secure` flag is omitted intentionally — the app may be served over plain HTTP (e.g. `sslip.io` without TLS).
+  Cookie attributes: `Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}` where `SESSION_TTL = max(30, CAP_SESSION_TTL_SECONDS)` (default 120 s; the floor of 30 prevents accidental sub-second TTLs from a misconfigured env var). Each accepted vote decrements the quota and renews the TTL. The session expires by time or by exhausting the quota, whichever comes first. The `Secure` flag is omitted intentionally — the app may be served over plain HTTP (e.g. `sslip.io` without TLS).
 </ResponseField>
 
 <ResponseField name="voter_id" type="cookie">
@@ -79,15 +79,17 @@ If the Cap server returns a non-200 status or a body where `success` is not `tru
 
 On successful verification, `createSession(ip)` executes an atomic `MULTI/EXEC` pipeline against DragonFly:
 
+```redis
+SET cap:sess:{uuid}     "50"   EX <SESSION_TTL>
+SET cap:sess-ip:{uuid}  "<ip>" EX <SESSION_TTL>
 ```
-SET cap:sess:{uuid}     "50"  EX 120
-SET cap:sess-ip:{uuid}  "<ip>" EX 120
-```
+
+where `SESSION_TTL = max(30, CAP_SESSION_TTL_SECONDS)` (default 120 s).
 
 Both keys share the same TTL and are set atomically. The UUID returned becomes the `cap_session` cookie value.
 
 <Note>
-  The IP stored in `cap:sess-ip:{id}` is read from `captchaSessionIp(request)`, which calls `getTrustedClientIp` — it reads `CF-Connecting-IP` (Cloudflare) or the configured trusted proxy header. It never reads `X-Forwarded-For` directly to prevent spoofing.
+  The IP stored in `cap:sess-ip:{id}` is read from `captchaSessionIp(request)`, which calls `getTrustedClientIp` — it reads `CF-Connecting-IP` in production (Cloudflare), or falls back to `X-Real-IP` in non-production environments. It never reads `X-Forwarded-For` to prevent IP spoofing.
 </Note>
 
 ## Error responses
@@ -95,7 +97,7 @@ Both keys share the same TTL and are set atomically. The UUID returned becomes t
 | Status | Body `error` field | Cause |
 |---|---|---|
 | `400` | `invalid_body` | Request body is not valid JSON |
-| `403` | `trusted_ip_required` | `CF-Connecting-IP` (or trusted proxy header) is absent |
+| `403` | `trusted_ip_required` | `CF-Connecting-IP` is absent (production) or no usable IP can be determined |
 | `404` | `captcha_disabled` | `CAP_API_URL` not set or DragonFly unavailable |
 | `429` | `rate_limited` | Exceeded `CAP_REDEEM_MAX_PER_MINUTE` in the current window |
 | `502` | `captcha_unreachable` | Cap server did not respond within `CAP_HTTP_TIMEOUT_MS` |
@@ -111,6 +113,6 @@ Both keys share the same TTL and are set atomically. The UUID returned becomes t
 | `ORIGIN_GUARD_SECRET` | _(unset)_ | Fallback HMAC key if `VOTER_ID_SECRET` is not set. |
 | `CAP_VOTES_PER_SESSION` | `50` | Vote quota granted per solved captcha. |
 | `CAP_SESSION_HARD_VOTE_CAP` | `50` | Hard upper bound on vote quota (effective quota = `min` of both). |
-| `CAP_SESSION_TTL_SECONDS` | `120` | Session lifetime in seconds (reset on each accepted vote). |
+| `CAP_SESSION_TTL_SECONDS` | `120` | Session lifetime in seconds; effective TTL is `max(30, value)` (reset on each accepted vote). |
 | `CAP_REDEEM_MAX_PER_MINUTE` | `12` | Per-IP redeem rate limit. |
 | `CAP_HTTP_TIMEOUT_MS` | `5000` | Hard timeout (ms) for the server-to-Cap fetch. |

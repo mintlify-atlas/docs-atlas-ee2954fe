@@ -18,7 +18,7 @@ The rate limiter runs inside the atomic Lua script in `votes.ts`, which means th
 
 - Each IP gets a virtual token bucket keyed as `rl:{ip}` (a `HASH` with `tokens` and `updated` fields).
 - Tokens refill linearly over the configured window. At any moment:
-  ```
+  ```lua
   tokens = stored_tokens + (elapsed_ms × maxBucket / windowMs)
   tokens = min(tokens, maxBucket)
   ```
@@ -127,7 +127,7 @@ Content-Type: application/json
 
 ## Defense against memory DoS
 
-`POST /api/vote` reads the request body with a hard byte cap of **2 048 bytes** (`MAX_BODY_BYTES`). The stream is consumed byte-by-byte; if the accumulated size exceeds the limit the request is rejected immediately, regardless of what the `Content-Length` header claims. This prevents an attacker from streaming a large body to exhaust server memory.
+`POST /api/vote` reads the request body with a hard byte cap of **2 048 bytes** (`MAX_BODY_BYTES`). The stream is consumed chunk by chunk using `ReadableStream.getReader()`; the running total is checked after each chunk arrives and the stream is cancelled immediately once the limit is exceeded, regardless of what the `Content-Length` header claims. This prevents an attacker from streaming a large body to exhaust server memory.
 
 ---
 

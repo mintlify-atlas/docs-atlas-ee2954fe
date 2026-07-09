@@ -1,7 +1,7 @@
 ---
 title: "GET /api/stream — Server-Sent Events for Real-Time Rankings"
 sidebarTitle: "GET /api/stream"
-description: "GET /api/stream delivers live WorldSnapshot updates via SSE. One serialization per tick is fanned out to all subscribers — viewer count does not increase DragonFly load."
+description: "GET /api/stream pushes live WorldSnapshot updates via SSE. One serialization per tick fans out to all clients; more viewers never increase DragonFly load."
 ---
 
 `GET /api/stream` opens a persistent Server-Sent Events (SSE) connection. The server pushes a serialized `WorldSnapshot` every `STREAM_INTERVAL_MS` (default **1 second**, configurable via environment variable) whenever the ranking data has changed. When there are no updates — for example, during a lull in voting — the server emits a `: ping` keep-alive comment every 20 seconds instead, preventing proxies and load balancers from closing the idle connection.
@@ -28,7 +28,7 @@ The server enforces two independent connection limits to protect against resourc
 
 Each update is delivered as a standard SSE `data:` event containing a JSON-serialized `WorldSnapshot`. Keep-alive pings are delivered as SSE comment lines (`: ping`), which browsers ignore but which reset proxy idle timers.
 
-```
+```text
 data: {"ranking":[...],"totalVotes":87234,"clicksPerMinute":1420,"blockedClicks":342,"events":[...]}
 
 : ping

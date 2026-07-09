@@ -24,7 +24,7 @@ POST /api/captcha/challenge HTTP/1.1
 
 No request body is required. Any body sent by the widget is **ignored** — difficulty is set server-side to prevent clients from requesting easier puzzles.
 
-The `CF-Connecting-IP` header must be present. In production this is injected by Cloudflare; in local development behind a trusted proxy it is read from `X-Forwarded-For`.
+The `CF-Connecting-IP` header must be present. In production this is injected by Cloudflare. In local development (non-production `NODE_ENV`) the fallback reads `X-Real-IP` instead. `X-Forwarded-For` is never trusted.
 
 ## Rate limiting
 
@@ -85,7 +85,7 @@ The `challenge` token is an opaque string issued by the Cap server. The widget u
 
 | Status | Body `error` field | Cause |
 |---|---|---|
-| `403` | `trusted_ip_required` | `CF-Connecting-IP` (or trusted proxy header) is absent |
+| `403` | `trusted_ip_required` | `CF-Connecting-IP` is absent (production) or no usable IP can be determined |
 | `404` | `captcha_disabled` | `CAP_API_URL` is not set or DragonFly is unavailable |
 | `429` | `rate_limited` | Exceeded `CAP_CHALLENGE_MAX_PER_MINUTE` in the current window |
 | `502` | `captcha_unreachable` | The Cap server did not respond within `CAP_HTTP_TIMEOUT_MS` (default 5 000 ms) |
